@@ -91,13 +91,20 @@ run beam search on GPU. In a quiet room that costs roughly one word error in
 ninety; in babble it is closer to three in ninety. See
 [docs/findings.md](docs/findings.md).
 
-Switch at any time — the model stays cached, so it's just a restart:
+Switch at any time with `dictate-backend`. Both models stay on disk, so it is
+just a daemon restart — about 1s to CPU, 2s to GPU:
 
 ```sh
-systemctl --user edit dictation      # set DICTATE_BACKEND
-systemctl --user restart dictation
-journalctl --user -u dictation -n5   # confirms which backend loaded
+dictate-backend status           # which one is live
+dictate-backend openvino         # switch to the iGPU
+dictate-backend faster-whisper   # switch back to CPU
 ```
+
+It writes a systemd drop-in at
+`~/.config/systemd/user/dictation.service.d/backend.conf` rather than editing
+the unit, so your choice survives re-running `install.sh`. It waits for the
+daemon to actually report ready and prints the backend that loaded — so a
+failed switch is visible rather than silent.
 
 The daemon logs `Ready: <backend>` on startup, and **falls back to
 `faster-whisper` automatically** if OpenVINO or its model is unavailable, so a
@@ -144,6 +151,7 @@ contained to that one phrase. See findings.
 ```
 src/dictate-server.py          resident daemon
 bin/dictate-toggle             hotkey client
+bin/dictate-backend            switch CPU <-> iGPU backend
 systemd/dictation.service      user service (templated)
 systemd/ydotool-override.conf  system drop-in (templated)
 install.sh                     deploys all of the above

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Switch the dictation transcription backend.
+#
+# Writes a systemd drop-in rather than editing the unit itself, so the choice
+# survives re-running install.sh.
+set -euo pipefail
+
+DROPIN_DIR="$HOME/.config/systemd/user/dictation.service.d"
+DROPIN="$DROPIN_DIR/backend.conf"
+
+current() {
+  local pid
+  pid=$(systemctl --user show dictation.service -p MainPID --value 2>/dev/null || echo 0)
+  if [[ "$pid" != "0" ]] && [[ -r "/proc/$pid/environ" ]]; then
+    tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's/^DICTATE_BACKEND=//p'
+  else
+    echo "(not running)"
+  fi
+}
+
+usage() {
+  cat <<EOF
+usage: dictate-backend [faster-whisper|openvino|status]
+
+  faster-whisper   CPU, beam search. Slower, most accurate.
+  openvino         Intel iGPU, greedy. ~2.2x faster, ~1 extra word
+                   error per 90 on clean speech, more in noise.
+  status           show which backend is live
+
+currently: $(current)
+EOF
+}
+
+case "${1:-status}" in
+  status)
+    echo "backend: $(current)"
+    systemctl --user is-active --quiet dictation.service \
+      && echo "service: active" || echo "service: NOT running"
+    ;;
+  faster-whisper|openvino)
+    mkdir -p "$DROPIN_DIR"
+    printf '[Service]\nEnvironment=DICTATE_BACKEND=%s\n' "$1" > "$DROPIN"
+    systemctl --user daemon-reload
+    systemctl --user restart dictation.service
+    # Wait for THIS process to report ready. Matching on time alone races
+    # against the previous start's log lines, which look identical.
+    pid=$(systemctl --user show dictation.service -p MainPID --value)
+    for _ in $(seq 1 30); do
+      ready=$(journalctl --user -u dictation.service --no-pager 2>/dev/null \
+              | grep "python\[$pid\]: Ready:" | tail -1 || true)
+      if [[ -n "$ready" ]]; then
+        echo "backend: $(current)"
+        echo "$ready" | sed 's/.*python\[[0-9]*\]: /  /'
+        exit 0
+      fi
+      systemctl --user is-active --quiet dictation.service || {
+        echo "daemon died; see: journalctl --user -u dictation -e" >&2; exit 1; }
+      sleep 1
+    done
+    echo "timed out waiting for daemon; see: journalctl --user -u dictation -e" >&2
+    exit 1
+    ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

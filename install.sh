@@ -88,6 +88,7 @@ fi
 say "Installing daemon and client"
 install -m 0644 "$REPO/src/dictate-server.py" "$SHARE/dictate-server.py"
 install -m 0755 "$REPO/bin/dictate-toggle" "$BIN/dictate-toggle"
+install -m 0755 "$REPO/bin/dictate-backend" "$BIN/dictate-backend"
 sed -e "s/@MODEL@/$MODEL/" -e "s/@MODE@/$MODE/" \
     -e "s/@BACKEND@/$BACKEND/" -e "s|@OV_DEVICE@|$OV_DEVICE|" \
   "$REPO/systemd/dictation.service" > "$UNIT/dictation.service"
