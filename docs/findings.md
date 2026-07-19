@@ -104,6 +104,35 @@ better than the figure suggests.
 
 `beam_size=1` vs `5` is ~0.1s on an 8s clip. Irrelevant; kept at 5.
 
+### RNNoise noise suppression — actively harmful
+
+Tested via ffmpeg's built-in `arnndn` filter across three independently trained
+models. WER against the same reference utterance:
+
+| Model | Clean | Babble 5dB SNR |
+|---|---|---|
+| none | 2.3% | **40.9%** |
+| `sh` (somnolent-hogwash) | 2.3% | 63.6% |
+| `bd` (beguiling-drafter) | 0.0% | 65.9% |
+| `mp` (marathon-prescription) | 0.0% | 58.0% |
+
+Neutral on clean speech (the 0.0% vs 2.3% is one or two words on a single
+utterance — noise), and **consistently much worse on babble**.
+
+RNNoise suppresses *non-speech* noise; babble is speech, so it cannot remove it
+and instead distorts the target speaker while trying. Whisper was trained on
+680k hours of noisy real-world audio and is already noise-robust — what it is
+*not* robust to is unfamiliar front-end processing artifacts. Front-end
+enhancement degrading robust ASR is a well-established result; RNNoise optimises
+perceptual quality for human listeners, a different objective.
+
+Not installed. Fedora has no package for it anyway (`arnndn` is built into
+ffmpeg; models come from GregorR/rnnoise-models).
+
+**Gotcha:** RNNoise runs at 48kHz. ffmpeg auto-resamples input up but leaves the
+output at 48kHz — feed that to a 16kHz pipeline unchanged and it plays at a
+third speed. Chain `aresample=48000,arnndn=...,aresample=16000`.
+
 ### NPU / new hardware
 
 Not worth it. Battery impact is already negligible (below). Also
@@ -145,6 +174,58 @@ states, understates absolute system draw. Transcribing draw varied 28.4W then
 power limit.
 
 ---
+
+## Noise robustness
+
+WER vs SNR, same reference utterance. Synthetic speech with synthetic noise, so
+treat absolute numbers as indicative — the *shape* is the finding.
+
+| Interference | 20dB | 10dB | 5dB | 0dB |
+|---|---|---|---|---|
+| Steady (HVAC, hum) | 6.8% | 13.6% | 11.4% | 38.6% |
+| Babble (competing speech) | 5.7% | 11.4% | **43.2%** | **100%** |
+
+*(clean baseline 2.3%)*
+
+**Steady noise degrades gracefully; competing speech falls off a cliff between
+10dB and 5dB.** Whisper has no speaker targeting — it does not know which voice
+is yours. At 0dB babble it emitted nothing at all, which is the safe failure.
+
+Practical consequence: a close-talk/headset mic is worth more than any software
+change, because it moves you from the ~5dB regime to the ~20dB regime where WER
+is around 6%.
+
+## Microphone array
+
+`Mic1` exposes 4 channels (`s32le 4ch 48000Hz`). Measured per-channel:
+
+| Channel | RMS | Verdict |
+|---|---|---|
+| 0 | 0.0167 | live |
+| 1 | 0.0000 | **dead — not a mic** |
+| 2 | 0.0174 | live |
+| 3 | 0.0179 | live |
+
+On Windows this array is processed in the Intel SST DSP by proprietary OEM
+firmware (beamforming, NR, AEC) and applications see one clean mono stream. On
+Linux, SOF is open firmware without those blobs, so the raw array is exposed and
+any processing must happen in software.
+
+**The dead channel is harmless.** Averaging `(ch0+0+ch2+ch3)/4` is exactly ¾ of
+`(ch0+ch2+ch3)/3` — a uniform scalar that attenuates signal and noise equally.
+SNR is identical; it costs 2.5dB of level at −41dBFS, still ~55dB above the
+16-bit floor, and Whisper normalises input anyway.
+
+**The naive downmix is already a crude beamformer.** Averaging is delay-and-sum
+with zero delay — a broadside beamformer, steered perpendicular to the array,
+which for a laptop lid is roughly where the user's face is. Channels 0 and 2
+correlated only **0.15** on ambient noise (spatially incoherent diffuse noise
+cancels on averaging) while coherent point-source speech sums constructively.
+That is a real ~√3 SNR gain obtained for free.
+
+Steered beamforming (MVDR, delay-and-sum with real delays) would need physical
+mic geometry in millimetres, which OEMs don't publish and ACPI rarely exposes.
+Not worth reverse-engineering for the margin over broadside averaging.
 
 ## Whisper behaviour
 
@@ -222,3 +303,12 @@ sloppy method:
    impossible result that transcribing drew *less* power than idle.
    *Run benchmarks sequentially, with a settling period, interleaved and
    repeated.*
+3. **Fed 48kHz audio to a 16kHz pipeline** while testing RNNoise, reporting 100%
+   WER across every condition. The audio was playing at a third speed; the
+   denoiser was fine. *Assert the sample rate when loading audio* — the reader
+   now does.
+
+Common thread: every wrong conclusion came from the harness, not the system
+under test. A result that looks dramatic (superlinear blowup, negative power
+draw, total failure) is far more likely to be a measurement bug than a real
+discovery. Check the harness first.
