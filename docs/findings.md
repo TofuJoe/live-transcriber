@@ -184,6 +184,64 @@ ffmpeg; models come from GregorR/rnnoise-models).
 output at 48kHz — feed that to a 16kHz pipeline unchanged and it plays at a
 third speed. Chain `aresample=48000,arnndn=...,aresample=16000`.
 
+### Iris Xe iGPU via OpenVINO — works, ~2.4x faster, but costs accuracy
+
+Tested properly rather than assumed. Installed `intel-compute-runtime` +
+`intel-level-zero` (Fedora repos) and `openvino` / `openvino-genai` (PyPI), using
+the pre-converted `OpenVINO/whisper-small.en-int8-ov` model. `/dev/dri/renderD128`
+is world-readable, so no group changes were needed.
+
+**Encoder only**, interleaved, thread parity, single process:
+
+| Backend | median | vs current |
+|---|---|---|
+| CTranslate2 CPU (current) | 3021ms | 1.00x |
+| OpenVINO CPU | 2287ms | 1.32x |
+| OpenVINO iGPU | 1109ms | **2.72x** |
+
+**End-to-end**, mean WER across clean / white-10dB / babble-10dB / babble-5dB:
+
+| Backend | 5s clip | mean WER |
+|---|---|---|
+| **ct2 CPU beam=5 (current)** | 2285ms | **13.6%** |
+| ov CPU beam=5 | 2131ms | 15.9% |
+| ov GPU greedy | **953ms** | 16.2% |
+
+**Verdict: stay on faster-whisper.** The iGPU is genuinely ~2.4x faster
+end-to-end, but every OpenVINO path measured worse accuracy, and the current
+stack leads on the axis that matters for technical dictation.
+
+**Why the GPU is fast: it can't do beam search.** `openvino-genai` 2026.2.1 fails
+beam search on GPU — `Not Implemented` on remote tensors at `num_beams=2`, and
+`Logits batch size doesn't match the number of beams` at 5. It works on OpenVINO
+CPU, so this is a GPU-path limitation, not a Whisper one.
+
+**Beam search is worth +4.5% WER, consistently:**
+
+| Condition | beam=1 | beam=5 | gain |
+|---|---|---|---|
+| clean | 4.5% | 0.0% | +4.5 |
+| white 10dB | 10.2% | 6.8% | +3.4 |
+| babble 10dB | 15.9% | 10.2% | +5.7 |
+| babble 5dB | 42.0% | 37.5% | +4.5 |
+| **mean** | 18.2% | 13.6% | **+4.5** |
+
+Consistent across all four conditions, and it costs only ~6% more time on CPU
+(2220ms vs 2363ms). That is why `beam_size=5` stays.
+
+OpenVINO CPU *with* beam=5 is only 7% faster than CTranslate2 and still less
+accurate (15.9% vs 13.6%), so it isn't a free win either.
+
+**Method note:** the first end-to-end comparison was unfair — `openvino-genai`
+defaults to `num_beams=1` while faster-whisper was on `beam_size=5`. It looked
+like a 2.8x speedup at equal accuracy; matching decoders showed the speed was
+partly bought with greedy decoding. At matched greedy both produce *identical*
+4.5% WER, which is how the beam-search explanation was isolated.
+
+Side finding: `repetition_penalty=1.1` costs a little accuracy on clean speech
+(2.3% vs 0.0% WER). Kept anyway — it guards the repetition-loop failure mode,
+which is far more destructive than a single word error.
+
 ### NPU / new hardware
 
 Not worth it. Battery impact is already negligible (below). Also
