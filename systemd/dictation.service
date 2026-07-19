@@ -1,5 +1,5 @@
 [Unit]
-Description=Voice dictation daemon (faster-whisper)
+Description=Voice dictation daemon
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -7,6 +7,8 @@ PartOf=graphical-session.target
 Type=simple
 Environment=DICTATE_MODEL=@MODEL@
 Environment=DICTATE_MODE=@MODE@
+Environment=DICTATE_BACKEND=@BACKEND@
+Environment=DICTATE_OV_DEVICE=@OV_DEVICE@
 ExecStart=%h/.local/share/voice-dictation/venv/bin/python %h/.local/share/voice-dictation/dictate-server.py
 Restart=on-failure
 RestartSec=3

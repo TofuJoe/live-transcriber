@@ -74,8 +74,37 @@ systemctl --user restart dictation
 
 | Variable | Default | Notes |
 |---|---|---|
+| `DICTATE_BACKEND` | `faster-whisper` | `openvino` runs on the Intel iGPU |
+| `DICTATE_OV_DEVICE` | `GPU` | `CPU` or `HETERO:GPU,CPU` also work |
 | `DICTATE_MODEL` | `small.en` | `base.en` is ~2.6x faster, less accurate |
 | `DICTATE_MODE` | `phrase` | `single` types everything at once on stop |
+
+### Choosing a backend
+
+| Backend | 5s phrase | Decoding | Use when |
+|---|---|---|---|
+| `faster-whisper` | ~1450ms | beam=5 | Accuracy matters — noisy rooms, technical terms |
+| `openvino` | ~660ms | greedy | Speed matters — quiet room, everyday dictation |
+
+**openvino is ~2.2x faster but greedy-only** — `openvino-genai` 2026.2.1 cannot
+run beam search on GPU. In a quiet room that costs roughly one word error in
+ninety; in babble it is closer to three in ninety. See
+[docs/findings.md](docs/findings.md).
+
+Switch at any time — the model stays cached, so it's just a restart:
+
+```sh
+systemctl --user edit dictation      # set DICTATE_BACKEND
+systemctl --user restart dictation
+journalctl --user -u dictation -n5   # confirms which backend loaded
+```
+
+The daemon logs `Ready: <backend>` on startup, and **falls back to
+`faster-whisper` automatically** if OpenVINO or its model is unavailable, so a
+broken GPU stack degrades rather than breaking dictation.
+
+`faster-whisper` is always installed regardless of backend — it supplies the
+Silero VAD used for endpointing.
 
 Tunables in `src/dictate-server.py`:
 

@@ -27,6 +27,12 @@ from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 MODEL = os.environ.get("DICTATE_MODEL", "small.en")
 MODE = os.environ.get("DICTATE_MODE", "phrase")
+BACKEND = os.environ.get("DICTATE_BACKEND", "faster-whisper")
+OV_MODEL_DIR = os.environ.get(
+    "DICTATE_OV_MODEL",
+    os.path.expanduser("~/.local/share/voice-dictation/ov-model"),
+)
+OV_DEVICE = os.environ.get("DICTATE_OV_DEVICE", "GPU")
 SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "dictate.sock")
 YDOTOOL_SOCKET = "/run/ydotoold/socket"
 
@@ -192,11 +198,79 @@ def find_commit_point(audio, speech_seen):
     return (cut if cut > 0 else None), False
 
 
+class FasterWhisperBackend:
+    """CPU transcription via CTranslate2. Slower, but supports beam search,
+    which is worth a few real word errors per hundred in noisy audio."""
+
+    label = "faster-whisper CPU (beam=5)"
+
+    def __init__(self, model_name):
+        from faster_whisper import WhisperModel
+
+        # int8 on CPU: best speed/accuracy tradeoff without a discrete GPU.
+        self.model = WhisperModel(
+            model_name, device="cpu", compute_type="int8", cpu_threads=8
+        )
+
+    def transcribe(self, audio):
+        # condition_on_previous_text=False + repetition_penalty guard against
+        # Whisper's repetition-loop failure mode on unclear or repetitive audio.
+        segments, _ = self.model.transcribe(
+            audio,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            repetition_penalty=1.1,
+        )
+        return " ".join(s.text.strip() for s in segments).strip()
+
+
+class OpenVinoBackend:
+    """iGPU transcription via OpenVINO. ~2.5x faster than the CPU backend.
+
+    Greedy decoding only: openvino-genai 2026.2.1 cannot run beam search on
+    GPU ("Not Implemented" on remote tensors at num_beams=2, logits/beam batch
+    mismatch at 5). On clean speech that costs about one word error in ninety;
+    in babble it is closer to three. See docs/findings.md.
+    """
+
+    label = f"openvino {OV_DEVICE} (greedy)"
+
+    def __init__(self, model_dir, device):
+        import openvino_genai as og
+
+        if not os.path.isdir(model_dir):
+            raise RuntimeError(
+                f"OpenVINO model not found at {model_dir}. "
+                "Run install.sh with DICTATE_BACKEND=openvino."
+            )
+        self.pipe = og.WhisperPipeline(model_dir, device=device)
+
+    def transcribe(self, audio):
+        return self.pipe.generate(audio).texts[0].strip()
+
+
+def make_backend():
+    """Build the configured backend, falling back to CPU if OpenVINO is
+    unavailable -- a missing GPU stack should degrade, not break dictation."""
+    if BACKEND == "openvino":
+        try:
+            return OpenVinoBackend(OV_MODEL_DIR, OV_DEVICE)
+        except Exception as exc:
+            print(f"openvino backend unavailable ({exc}); using CPU", flush=True)
+            notify(
+                "⚠️ OpenVINO unavailable",
+                "Fell back to the CPU backend.",
+                urgency="normal",
+            )
+    return FasterWhisperBackend(MODEL)
+
+
 class Session:
     """One recording session: reader thread + phrase-committing worker."""
 
-    def __init__(self, model, notif_id=None):
-        self.model = model
+    def __init__(self, backend, notif_id=None):
+        self.backend = backend
         self.notif_id = notif_id  # the persistent "Listening…" banner
         self.buf = bytearray()
         self.buf_lock = threading.Lock()
@@ -238,16 +312,7 @@ class Session:
         # transcription on a chunk that turns out to be pure silence.
         if not has_speech(audio):
             return
-        # condition_on_previous_text=False + repetition_penalty guard against
-        # Whisper's repetition-loop failure mode on unclear or repetitive audio.
-        segments, _ = self.model.transcribe(
-            audio,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            repetition_penalty=1.1,
-        )
-        text = " ".join(s.text.strip() for s in segments).strip()
+        text = self.backend.transcribe(audio)
         if not text:
             return
         type_text((" " if self.spoke else "") + text)
@@ -283,7 +348,7 @@ class Session:
         return self.spoke
 
 
-def handle_toggle(model):
+def handle_toggle(backend):
     global session
     with state_lock:
         if session is None:
@@ -297,7 +362,7 @@ def handle_toggle(model):
             # critical so GNOME keeps it on screen for the whole session --
             # otherwise there's no way to tell whether the mic is live.
             nid = notify("🎤 Listening…", hint, urgency="critical")
-            session = Session(model, nid)
+            session = Session(backend, nid)
         else:
             play_cue("complete")
             s, session = session, None
@@ -317,12 +382,9 @@ def handle_toggle(model):
 
 
 def main():
-    from faster_whisper import WhisperModel
-
-    print(f"Loading model {MODEL} (mode={MODE})…", flush=True)
-    # int8 on CPU: best speed/accuracy tradeoff without a discrete GPU.
-    model = WhisperModel(MODEL, device="cpu", compute_type="int8", cpu_threads=8)
-    print("Model ready.", flush=True)
+    print(f"Loading backend={BACKEND} model={MODEL} mode={MODE}…", flush=True)
+    backend = make_backend()
+    print(f"Ready: {backend.label}", flush=True)
 
     if os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)
@@ -337,7 +399,7 @@ def main():
             cmd = conn.recv(64).decode().strip()
             if cmd == "toggle":
                 try:
-                    handle_toggle(model)
+                    handle_toggle(backend)
                 except Exception as exc:  # keep the daemon alive across failures
                     print(f"error: {exc}", file=sys.stderr, flush=True)
                     notify("⚠️ Dictation error", str(exc), urgency="critical")

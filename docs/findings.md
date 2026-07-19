@@ -207,9 +207,10 @@ is world-readable, so no group changes were needed.
 | ov CPU beam=5 | 2131ms | 15.9% |
 | ov GPU greedy | **953ms** | 16.2% |
 
-**Verdict: stay on faster-whisper.** The iGPU is genuinely ~2.4x faster
-end-to-end, but every OpenVINO path measured worse accuracy, and the current
-stack leads on the axis that matters for technical dictation.
+**Verdict: shipped as a switchable backend** (`DICTATE_BACKEND=openvino`), not
+as the default. Measured in the installed daemon: 656ms vs 1456ms on a 5s
+phrase, ~2.2x. See "What the WER gap actually was" below — the accuracy cost is
+much smaller than the raw WER numbers suggested.
 
 **Why the GPU is fast: it can't do beam search.** `openvino-genai` 2026.2.1 fails
 beam search on GPU — `Not Implemented` on remote tensors at `num_beams=2`, and
@@ -241,6 +242,43 @@ partly bought with greedy decoding. At matched greedy both produce *identical*
 Side finding: `repetition_penalty=1.1` costs a little accuracy on clean speech
 (2.3% vs 0.0% WER). Kept anyway — it guards the repetition-loop failure mode,
 which is far more destructive than a single word error.
+
+### What the WER gap actually was — mostly spelling
+
+The "+4.5% WER" figure above is **substantially inflated**, and it nearly drove
+the wrong decision. Inspecting the individual error sites on clean speech:
+
+```
+beam=5:  0 error sites in 88 words
+beam=1:  3 error sites in 88 words
+    'harbour' -> 'harbor'      <- spelling variant, not an error
+    'come in' -> 'coming'      <- genuine error
+    'grey'    -> 'gray'        <- spelling variant, not an error
+```
+
+The reference text is British-spelled; `small.en` is trained largely on American
+English. **Greedy's real error rate on clean speech is ~1 word in 88, not 4.5%.**
+
+Worse, the model's spelling choice wanders with unrelated parameters — `beam=5`
+scored 2.3% in one run and 0.0% in another purely because `repetition_penalty`
+flipped `harbour`/`harbor`. A meaningful fraction of *every* WER number in this
+document is spelling noise.
+
+Genuine error counts, beam=5 vs beam=1:
+
+| Condition | beam=5 | beam=1 | real difference |
+|---|---|---|---|
+| clean | 0 | 1 | 1 word in 88 |
+| white 10dB | 4 | 5 | 1 |
+| babble 10dB | 6 | 9 | 3 |
+
+In noise the errors are real (`'grey sky'->'race guy'`, `'bought'->'walked'`) and
+beam search genuinely helps. In a quiet room it barely matters — which is what
+made the GPU backend worth shipping.
+
+**Lesson: never act on an aggregate WER without reading the actual errors.**
+Normalise spelling variants, or inspect the diff. This was the only measurement
+mistake in this project that changed a recommendation rather than just a number.
 
 ### NPU / new hardware
 

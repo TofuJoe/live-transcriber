@@ -14,6 +14,9 @@ UNIT="$HOME/.config/systemd/user"
 MODEL="${DICTATE_MODEL:-small.en}"
 MODE="${DICTATE_MODE:-phrase}"
 HOTKEY="${DICTATE_HOTKEY:-<Super>a}"
+BACKEND="${DICTATE_BACKEND:-faster-whisper}"   # faster-whisper | openvino
+OV_DEVICE="${DICTATE_OV_DEVICE:-GPU}"          # GPU | CPU | HETERO:GPU,CPU
+OV_REPO="OpenVINO/whisper-small.en-int8-ov"
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -52,13 +55,41 @@ say "Setting up Python environment"
 mkdir -p "$SHARE" "$BIN" "$UNIT"
 [[ -d "$SHARE/venv" ]] || python3 -m venv "$SHARE/venv"
 "$SHARE/venv/bin/pip" install --quiet --upgrade pip
+# faster-whisper is always needed: it supplies the Silero VAD used for
+# endpointing, regardless of which backend does the transcribing.
 "$SHARE/venv/bin/pip" install --quiet faster-whisper
+
+if [[ "$BACKEND" == "openvino" ]]; then
+  say "Setting up OpenVINO backend (device=$OV_DEVICE)"
+  # Intel GPU compute stack: OpenCL + Level Zero. /dev/dri/renderD128 is
+  # world-readable on Fedora, so no group membership is needed.
+  ovpkgs=()
+  for pkg in intel-compute-runtime intel-level-zero oneapi-level-zero; do
+    rpm -q "$pkg" >/dev/null 2>&1 || ovpkgs+=("$pkg")
+  done
+  ((${#ovpkgs[@]})) && sudo dnf install -y "${ovpkgs[@]}"
+  "$SHARE/venv/bin/pip" install --quiet openvino openvino-genai
+  if [[ ! -d "$SHARE/ov-model" ]]; then
+    say "Downloading $OV_REPO (~245MB)"
+    "$SHARE/venv/bin/python" - <<PY
+from huggingface_hub import snapshot_download
+snapshot_download("$OV_REPO", local_dir="$SHARE/ov-model")
+PY
+  fi
+  "$SHARE/venv/bin/python" -c "
+import openvino as ov
+devs=ov.Core().available_devices
+print('  OpenVINO devices:', devs)
+raise SystemExit(0 if any(d.startswith('GPU') for d in devs) or '$OV_DEVICE'=='CPU' else 1)
+" || die "OpenVINO cannot see the GPU; check intel-compute-runtime"
+fi
 
 # ----------------------------------------------------------------- files
 say "Installing daemon and client"
 install -m 0644 "$REPO/src/dictate-server.py" "$SHARE/dictate-server.py"
 install -m 0755 "$REPO/bin/dictate-toggle" "$BIN/dictate-toggle"
 sed -e "s/@MODEL@/$MODEL/" -e "s/@MODE@/$MODE/" \
+    -e "s/@BACKEND@/$BACKEND/" -e "s|@OV_DEVICE@|$OV_DEVICE|" \
   "$REPO/systemd/dictation.service" > "$UNIT/dictation.service"
 
 # --------------------------------------------------------------- hotkey
