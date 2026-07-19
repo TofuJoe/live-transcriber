@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Thin client bound to the GNOME hotkey. Nudges the resident daemon.
+set -euo pipefail
+SOCK="${XDG_RUNTIME_DIR:-/tmp}/dictate.sock"
+
+if [[ ! -S "$SOCK" ]]; then
+  notify-send --app-name=Dictation --urgency=critical \
+    "Dictation daemon not running" "Start it: systemctl --user start dictation"
+  exit 1
+fi
+
+printf 'toggle' | socat - "UNIX-CONNECT:$SOCK" 2>/dev/null \
+  || printf 'toggle' | nc -U -w1 "$SOCK" 2>/dev/null \
+  || python3 -c "
+import socket,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.connect('$SOCK'); s.sendall(b'toggle'); s.close()
+"
