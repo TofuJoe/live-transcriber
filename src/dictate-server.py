@@ -32,6 +32,7 @@ YDOTOOL_SOCKET = "/run/ydotoold/socket"
 
 SR = 16000
 SILENCE_MS = 500  # pause that ends a phrase
+TAIL_MS = SILENCE_MS + 300  # window scanned to detect end-of-phrase
 MAX_SEG_S = 25  # force a cut before Whisper's 30s window
 READ_BYTES = 3200  # 100ms of s16le mono @16k
 
@@ -140,29 +141,55 @@ def type_text(text):
     subprocess.run(["wl-copy", "--", text], check=False)
 
 
-def find_commit_point(audio):
-    """Return a sample index to cut at, or None if the phrase is still open.
-
-    A phrase is committable once VAD sees speech followed by SILENCE_MS of
-    quiet. If the buffer grows past MAX_SEG_S we cut anyway rather than let it
-    exceed the model's context window.
-    """
-    opts = VadOptions(
-        threshold=0.5,
-        min_silence_duration_ms=SILENCE_MS,
-        speech_pad_ms=200,
+def has_speech(audio, min_silence_ms=0):
+    """Does this audio contain any speech at all?"""
+    return bool(
+        get_speech_timestamps(
+            audio,
+            VadOptions(
+                threshold=0.5,
+                min_speech_duration_ms=0,
+                min_silence_duration_ms=min_silence_ms,
+                speech_pad_ms=0,
+            ),
+        )
     )
-    stamps = get_speech_timestamps(audio, opts)
-    if not stamps:
-        # Pure silence: drop all but a short tail so the buffer can't grow.
-        return len(audio) - SR if len(audio) > 3 * SR else None
 
-    end = stamps[-1]["end"]
-    if len(audio) - end >= SILENCE_MS / 1000 * SR:
-        return min(end + int(0.2 * SR), len(audio))
-    if len(audio) >= MAX_SEG_S * SR:
-        return end
-    return None
+
+def find_commit_point(audio, speech_seen):
+    """Decide whether to cut. Returns (cut_index_or_None, speech_seen).
+
+    Scans only the last TAIL_MS of the buffer, not all of it. Scanning the whole
+    buffer every poll is O(n) per poll and therefore O(n^2) over a phrase -- at a
+    25s buffer that was 47ms of VAD every 400ms, ~12% of a core, growing the
+    longer you talk. The tail is all we actually need: if it has gone quiet, the
+    phrase is over.
+
+    `speech_seen` carries the one bit of history the tail can't tell us -- did
+    any speech occur since the last cut. Without it, the silence left in the
+    buffer after a commit re-triggers immediately, emitting empty chunks.
+
+    The cut lands where a full scan would. At the first poll with a silent tail,
+    len(audio) ~= speech_end + TAIL_MS, so len(audio) - tail ~= speech_end.
+    """
+    tail_n = int(TAIL_MS / 1000 * SR)
+    if len(audio) < tail_n + int(0.3 * SR):
+        return None, speech_seen  # not enough yet to judge
+
+    if has_speech(audio[-tail_n:]):
+        if len(audio) >= MAX_SEG_S * SR:
+            return len(audio), False  # force a cut before the 30s window
+        return None, True
+
+    if not speech_seen:
+        # Nothing but silence. Trim so the buffer can't grow unbounded; _emit
+        # discards it without paying for transcription.
+        return (len(audio) - tail_n, False) if len(audio) > 3 * SR else (None, False)
+
+    # Tail is quiet and we heard speech: the phrase is done. Keep 200ms of
+    # trailing silence in the chunk -- Whisper transcribes better with it.
+    cut = len(audio) - tail_n + int(0.2 * SR)
+    return (cut if cut > 0 else None), False
 
 
 class Session:
@@ -207,6 +234,10 @@ class Session:
     def _emit(self, audio):
         if audio.size < 0.3 * SR:  # too short to be speech
             return
+        # One VAD pass per commit (not per poll) to avoid paying ~1.5s of
+        # transcription on a chunk that turns out to be pure silence.
+        if not has_speech(audio):
+            return
         # condition_on_previous_text=False + repetition_penalty guard against
         # Whisper's repetition-loop failure mode on unclear or repetitive audio.
         segments, _ = self.model.transcribe(
@@ -226,11 +257,12 @@ class Session:
         if MODE == "single":
             self.stopping.wait()
             return
+        speech_seen = False
         while not self.stopping.wait(0.4):
             audio = self._snapshot()
             if audio.size < SR:
                 continue
-            cut = find_commit_point(audio)
+            cut, speech_seen = find_commit_point(audio, speech_seen)
             if cut and cut > 0:
                 self._emit(self._take(cut))
 

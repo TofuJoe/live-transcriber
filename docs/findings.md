@@ -63,6 +63,57 @@ Roughly **1.5s fixed cost per call**, scaling linearly beyond that. The fixed
 component is the encoder: Whisper pads every input to a 30s window regardless
 of clip length.
 
+### VAD rescan — was O(n^2), now O(1)
+
+The worker polls every 0.4s. The original `find_commit_point` ran Silero VAD
+over the **entire** buffer each poll, so cost grew with phrase length:
+
+| Buffer | Full scan | Tail scan | % of a core (full scan, per 0.4s poll) |
+|---|---|---|---|
+| 5s | 6.2ms | 1.1ms | 2.0% |
+| 10s | 12.6ms | 1.1ms | 4.8% |
+| 20s | 25.3ms | 1.1ms | 10.2% |
+| 25s | 34.2ms | 1.2ms | 11.9% |
+
+Total work over a phrase was O(n^2) — for a 25s phrase, ~1.5 core-seconds of
+VAD against ~12 core-seconds of transcription, so ~11% of compute spent
+re-scanning already-scanned audio.
+
+Only the **tail** is needed: if the last `TAIL_MS` has gone quiet, the phrase is
+over. Cost is now flat regardless of phrase length.
+
+The tail alone is not quite sufficient — it can't tell whether any speech
+happened since the last cut, so the silence left in the buffer after a commit
+re-triggers immediately and emits empty chunks. First attempt produced 4 commits
+where the old code produced 2. Fixed by threading one bit of state
+(`speech_seen`) through the poll loop.
+
+Verified byte-identical transcription output against the old implementation on a
+two-phrase stream, at 2.6x lower total VAD cost.
+
+`_emit` also gates on `has_speech` now: one VAD pass per *commit* (not per poll)
+avoids paying ~1.5s of transcription on a chunk that turns out to be silence.
+
+### Sample rate and bit depth — no headroom here
+
+Asked whether lowering either would save power. It would not:
+
+- **16kHz mono is fixed by the model.** Whisper's feature extractor builds an
+  80-bin log-Mel spectrogram from 16kHz audio. Recording at 48kHz would mean
+  downsampling before inference — strictly more work. Capturing at 16k lets
+  PipeWire do the conversion once in its own pipeline.
+- **`s16` is already the sensible floor.** ~96dB dynamic range against speech
+  occupying ~40dB, and Whisper converts to float32 regardless.
+
+| Format | Data rate |
+|---|---|
+| current (16k s16 mono) | **31 kB/s** |
+| s32 instead | 62 kB/s |
+| hardware native (48k s32 4ch) | 750 kB/s |
+
+At 31 kB/s a full minute is under 2MB. Audio I/O is nowhere near the energy
+budget — transcription is ~90% of it.
+
 ### Endpointing (`SILENCE_MS`)
 
 Set to **500ms**. Do not drop to 300ms.
