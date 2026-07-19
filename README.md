@@ -121,6 +121,15 @@ install.sh                     deploys all of the above
 docs/findings.md               measurements behind every tuning decision
 ```
 
+## License
+
+[MIT](LICENSE).
+
+Note on dependencies: `ydotool` is AGPL-3.0, but it is invoked as a separate
+process rather than linked, so its terms don't extend to this project. The
+Python stack this actually imports — `faster-whisper`, `ctranslate2`,
+`onnxruntime` — is MIT, and the Whisper models themselves are MIT.
+
 ## Requirements
 
 Fedora with GNOME on Wayland; `ydotool`, `pipewire-utils`, `libnotify`,
