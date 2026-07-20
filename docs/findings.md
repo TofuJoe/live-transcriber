@@ -459,3 +459,93 @@ Common thread: every wrong conclusion came from the harness, not the system
 under test. A result that looks dramatic (superlinear blowup, negative power
 draw, total failure) is far more likely to be a measurement bug than a real
 discovery. Check the harness first.
+
+### base.en — fast enough, not accurate enough (tried in real use 2026-07-20)
+
+Ran `OpenVINO/whisper-base.en-int8-ov` as the live daily-driver model, then
+reverted the same day. Latency was not the problem; accuracy was.
+
+| | Params | Enc/dec layers | Width | On-disk (int8 OV) |
+|---|---|---|---|---|
+| `small.en` | 244M | 12 | 768 | 245 MB |
+| `base.en` | 74M | 6 | 512 | 81 MB |
+
+**Failure mode: confabulation, not garbling.** `base.en` emitted fluent,
+grammatical words that were never said — plausible enough to read past, which is
+worse than obvious noise because you don't catch it while dictating. A weaker
+decoder leans harder on its language prior when the acoustic evidence is
+ambiguous, so errors arrive pre-laundered into reasonable English.
+
+Two things compounded it:
+
+- **Greedy decoding.** The OpenVINO backend runs greedy (no beam search). On
+  `small.en` that costs ~1 word; on `base.en` it stacks a weaker LM on top of no
+  search, so a bad first token has nothing to recover it. `base.en` +
+  `beam_size=5` on the CPU backend would fare better — but hands back the speed
+  that motivated the switch.
+- **Technical vocabulary.** btrfs, ydotool, OpenVINO, systemd. Proper nouns and
+  jargon are precisely where parameter count pays, and they are most of what
+  gets dictated here.
+
+> **`small.en` is the floor for this workload.** The accuracy budget is already
+> spent on greedy decoding (worth it: 2.2x). Spending it a second time on a
+> smaller encoder compounds two hits for a shrinking latency return — see the
+> budget note below.
+
+**Why the latency case had weakened anyway.** The lever ranking in this doc was
+written when transcription cost ~1456ms on CPU. OpenVINO cut that to ~656ms, so
+the endpoint silence — not the model — became the dominant term. Moving to
+`base.en` would have recovered ~350ms of a ~2.3s budget while the ~800-1200ms
+endpoint sat untouched. Wrong knob.
+
+The model dir is kept at `~/.local/share/voice-dictation/ov-model-base.en`;
+re-test by pointing `DICTATE_OV_MODEL` at it via a systemd drop-in.
+
+### Moonshine v2 — the non-padding architecture doesn't help here (2026-07-20)
+
+Whisper pads every clip to a 30s encoder window, so a 3s phrase costs what a 25s
+one does. [Moonshine v2](https://arxiv.org/html/2602.12241v1) (MIT, English-only,
+onnxruntime) encodes variable length with no zero-padding — on paper the exact fix
+for short-phrase dictation. Tested against the deployed `small.en`. **Rejected.**
+
+Latency vs clip duration, same 20s recording of natural speech truncated to each
+length, best of 3 after a warm-up, sequential:
+
+| clip | `small.en`/iGPU | moonshine-M/CPU (245M) | moonshine-S/CPU (123M) |
+|---:|---:|---:|---:|
+| **2s** | **421ms** | 441ms | 418ms |
+| **3s** | **464ms** | 896ms | 799ms |
+| **5s** | **517ms** | 1720ms | 1033ms |
+| 8s | 736ms | 2880ms | 2112ms |
+| 12s | 869ms | 4402ms | 3322ms |
+| 20s | 1041ms | 7058ms | 4917ms |
+
+**The mechanism is real; the magnitude is not.** The curves behave exactly as the
+architectures predict — Whisper is near-flat (2.5x cost over a 10x duration range;
+fixed encoder dominates, only the decoder scales), Moonshine scales ~linearly (16x
+over the same range). But the crossover lands at **~2s**, and that is the only
+point where Moonshine is competitive. Across the 3-5s phrases this tool actually
+handles, `small.en` is 2-3x faster.
+
+Whisper's fixed encoder cost is only **421ms on the iGPU** — low enough that the
+padding waste never becomes the bottleneck it looks like on paper.
+
+**Accuracy was a tie.** On real voice both produced the same text, differing on one
+phrase ("which ... warn against" vs "with ... worn against"); `small.en` was
+correct. On a synthetic-TTS smoke test Moonshine-M got `openvino` right where
+`small.en` wrote "opinveno" — a single data point on unrepresentative audio, noted
+only because jargon is the axis that killed `base.en`.
+
+**Caveat, stated honestly:** Moonshine ran on CPU, `small.en` on the iGPU.
+A fair fight needs `onnxruntime-openvino`. But Moonshine would need ~3x from iGPU
+acceleration just to draw level at 5s, and it would still be scaling linearly
+against a flat curve — so it loses again on anything longer. Not pursued.
+
+> **The useful corollary:** transcription cost barely moves between a 2s and a 5s
+> phrase (421ms -> 517ms). Cutting phrases sooner buys **nothing** in transcription
+> time — it only changes when the clock starts. The endpoint silence is the entire
+> remaining latency budget. See the pause-gap logging added the same day.
+
+Harness kept in the session scratchpad (`sweep.py`, `compare.sh`,
+`bench_moonshine.py`, `bench_whisper.py`); models cached under
+`~/.cache/moonshine_voice` (665MB) — delete if not revisiting.
