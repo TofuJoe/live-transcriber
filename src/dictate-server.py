@@ -122,15 +122,6 @@ def hotkey_label():
     return "+".join(parts + [key.upper()]) if key else "+".join(parts)
 
 
-def play_cue(sound):
-    """Non-blocking audio cue, so recording state is audible without looking."""
-    subprocess.Popen(
-        ["canberra-gtk-play", "-f", f"/usr/share/sounds/freedesktop/stereo/{sound}.oga"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
 def type_text(text):
     """Inject text into whatever window has focus, and mirror to clipboard."""
     env = dict(os.environ, YDOTOOL_SOCKET=YDOTOOL_SOCKET)
@@ -352,7 +343,6 @@ def handle_toggle(backend):
     global session
     with state_lock:
         if session is None:
-            play_cue("message-new-instant")
             hk = hotkey_label()
             hint = (
                 f"Speak — text appears as you pause. {hk} to stop."
@@ -364,7 +354,6 @@ def handle_toggle(backend):
             nid = notify("🎤 Listening…", hint, urgency="critical")
             session = Session(backend, nid)
         else:
-            play_cue("complete")
             s, session = session, None
             spoke = s.stop()
             close_notification(s.notif_id)
