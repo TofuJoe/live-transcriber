@@ -153,6 +153,41 @@ def has_speech(audio, min_silence_ms=0):
     )
 
 
+def log_pause_gaps(audio):
+    """Log intra-phrase silence gaps so TAIL_MS can be chosen from measured
+    speech instead of guessed.
+
+    Every gap logged here *survived* the current endpoint -- it is a pause we
+    did not cut on. A shorter TAIL_MS of T would have split the phrase at any
+    gap >= T, so this distribution is precisely the cost curve for lowering the
+    threshold: pick T above the bulk of it and you keep clauses intact.
+
+    Runs off the hot path (caller threads it) so it never adds to the latency
+    it exists to reduce.
+    """
+    try:
+        ts = get_speech_timestamps(
+            audio,
+            VadOptions(
+                threshold=0.5,
+                min_speech_duration_ms=0,
+                min_silence_duration_ms=0,
+                speech_pad_ms=0,
+            ),
+        )
+        if len(ts) < 2:
+            return
+        gaps = [
+            round((b["start"] - a["end"]) / SR * 1000)
+            for a, b in zip(ts, ts[1:])
+        ]
+        gaps = [g for g in gaps if g > 0]
+        if gaps:
+            print(f"pause-gaps ms tail={TAIL_MS} {gaps}", flush=True)
+    except Exception as exc:  # diagnostics must never break dictation
+        print(f"pause-gap logging failed: {exc}", flush=True)
+
+
 def find_commit_point(audio, speech_seen):
     """Decide whether to cut. Returns (cut_index_or_None, speech_seen).
 
@@ -308,6 +343,10 @@ class Session:
             return
         type_text((" " if self.spoke else "") + text)
         self.spoke = True
+        # After typing: diagnostics must not sit between speech and keystrokes.
+        threading.Thread(
+            target=log_pause_gaps, args=(audio,), daemon=True
+        ).start()
 
     def _work_loop(self):
         if MODE == "single":
