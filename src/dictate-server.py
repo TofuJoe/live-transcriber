@@ -41,6 +41,13 @@ SILENCE_MS = 500  # pause that ends a phrase
 TAIL_MS = SILENCE_MS + 300  # window scanned to detect end-of-phrase
 MAX_SEG_S = 25  # force a cut before Whisper's 30s window
 READ_BYTES = 3200  # 100ms of s16le mono @16k
+# How often we check whether the phrase has ended. This is detection lag only:
+# TAIL_MS decides *what* a boundary is, POLL_S decides how fast we notice one,
+# so the two tune independently. At 0.4s the endpoint fired 800-1200ms after
+# speech stopped (TAIL_MS + up to a full tick); 0.1s tightens that to 800-900ms
+# and matches the rate audio actually arrives, so polling faster gains nothing.
+# Cost is one VAD pass over TAIL_MS of audio per tick -- ~1.5ms, ~1.5% of a core.
+POLL_S = 0.1
 
 RECORD_CMD = [
     "parecord",
@@ -353,7 +360,7 @@ class Session:
             self.stopping.wait()
             return
         speech_seen = False
-        while not self.stopping.wait(0.4):
+        while not self.stopping.wait(POLL_S):
             audio = self._snapshot()
             if audio.size < SR:
                 continue
