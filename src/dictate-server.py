@@ -46,6 +46,12 @@ SR = 16000
 SILENCE_MS = 500  # pause that ends a phrase
 TAIL_MS = SILENCE_MS + 300  # window scanned to detect end-of-phrase
 MAX_SEG_S = 25  # force a cut before Whisper's 30s window
+SOFT_SEG_S = 20  # from here on, take any decent pause rather than wait for one
+# Shortest pause worth cutting at once past SOFT_SEG_S. Measured intra-phrase
+# gaps (the `pause-gaps` log) cluster at 32-128ms for stop consonants and
+# word joins, then thin out above ~200ms, so this sits above the articulation
+# noise and below anything a speaker would hear as a pause.
+OPPORTUNISTIC_GAP_MS = 200
 READ_BYTES = 3200  # 100ms of s16le mono @16k
 # How often we check whether the phrase has ended. This is detection lag only:
 # TAIL_MS decides *what* a boundary is, POLL_S decides how fast we notice one,
@@ -221,6 +227,44 @@ def quietest_cut(window, search_s=5):
     return start + a["end"] + gap // 2 if gap > 0 else None
 
 
+def opportunistic_cut(audio):
+    """Earliest usable pause after SOFT_SEG_S, or None if speech is unbroken.
+
+    Between SOFT_SEG_S and MAX_SEG_S a cut is already inevitable -- the 30s
+    encoder window is closing in and no TAIL_MS pause has arrived to end the
+    phrase normally. So relax what counts as a boundary: accept a pause far too
+    short to end a phrase but long enough to fall between words. That trades a
+    slightly early cut for not slicing through the middle of one.
+
+    Earliest qualifying gap, not the widest. The buffer is still filling, so a
+    wider gap may never arrive, and holding out for one spends the very margin
+    this exists to use.
+
+    Scans SOFT_SEG_S..now, so cost grows with how long the speaker has gone
+    without pausing: 1.3ms at 21s, 6.4ms at the 25s cap, i.e. at most 6.4% of a
+    core at POLL_S -- and only during a monologue that has run 20s unbroken. The
+    scan resets as soon as a gap is found, because we cut there.
+    """
+    start = int(SOFT_SEG_S * SR)
+    if audio.size <= start:
+        return None
+    ts = get_speech_timestamps(
+        audio[start:],
+        VadOptions(
+            threshold=0.5,
+            min_speech_duration_ms=0,
+            min_silence_duration_ms=0,
+            speech_pad_ms=0,
+        ),
+    )
+    min_gap = int(OPPORTUNISTIC_GAP_MS / 1000 * SR)
+    for a, b in zip(ts, ts[1:]):
+        gap = b["start"] - a["end"]
+        if gap >= min_gap:
+            return start + a["end"] + gap // 2
+    return None
+
+
 def split_for_transcription(audio):
     """Break an oversized buffer into <= MAX_SEG_S pieces.
 
@@ -259,6 +303,11 @@ def find_commit_point(audio, speech_seen):
 
     The cut lands where a full scan would. At the first poll with a silent tail,
     len(audio) ~= speech_end + TAIL_MS, so len(audio) - tail ~= speech_end.
+
+    Past SOFT_SEG_S the tail-only rule stops being enough. A speaker who has run
+    20s without a TAIL_MS pause is going to be cut at the cap regardless, so from
+    there we widen the search and take progressively worse pauses rather than
+    arrive at MAX_SEG_S with nowhere good to cut. See opportunistic_cut.
     """
     tail_n = int(TAIL_MS / 1000 * SR)
     if len(audio) < tail_n + int(0.3 * SR):
@@ -266,7 +315,15 @@ def find_commit_point(audio, speech_seen):
 
     if has_speech(audio[-tail_n:]):
         if len(audio) >= MAX_SEG_S * SR:
-            return len(audio), False  # force a cut before the 30s window
+            # Out of room. Nothing cleared OPPORTUNISTIC_GAP_MS in the last 5s,
+            # so settle for the widest gap there is -- a 60ms one still beats
+            # cutting blind at the cap. Only truly gapless audio falls through.
+            widest = quietest_cut(audio, search_s=MAX_SEG_S - SOFT_SEG_S)
+            return (widest or len(audio)), False
+        if len(audio) >= SOFT_SEG_S * SR:
+            cut = opportunistic_cut(audio)
+            if cut:
+                return cut, False
         return None, True
 
     if not speech_seen:
