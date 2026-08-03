@@ -10,12 +10,18 @@ talking. Committing only at pause boundaries means emitted text is never
 revised -- important because we inject keystrokes into apps we don't own, where
 "correcting" would mean backspacing over text we can't see.
 
+Three threads, decoupled by queues so a slow or failing stage can never cost
+audio: a reader appends capture to a byte buffer, a detector scans it for phrase
+boundaries and hands each finished phrase off, and a single transcriber drains
+that queue. Only the transcriber types, so phrases land in the order spoken.
+
   DICTATE_MODE=phrase  (default) type each phrase as you finish it
   DICTATE_MODE=single            type everything at once when you stop
 """
 
 import functools
 import os
+import queue
 import re
 import socket
 import subprocess
@@ -195,6 +201,49 @@ def log_pause_gaps(audio):
         print(f"pause-gap logging failed: {exc}", flush=True)
 
 
+def quietest_cut(window, search_s=5):
+    """Index of the middle of the widest silence in the last `search_s` of
+    `window`, or None if it is wall-to-wall speech."""
+    start = max(0, window.size - int(search_s * SR))
+    ts = get_speech_timestamps(
+        window[start:],
+        VadOptions(
+            threshold=0.5,
+            min_speech_duration_ms=0,
+            min_silence_duration_ms=0,
+            speech_pad_ms=0,
+        ),
+    )
+    if len(ts) < 2:
+        return None
+    a, b = max(zip(ts, ts[1:]), key=lambda p: p[1]["start"] - p[0]["end"])
+    gap = b["start"] - a["end"]
+    return start + a["end"] + gap // 2 if gap > 0 else None
+
+
+def split_for_transcription(audio):
+    """Break an oversized buffer into <= MAX_SEG_S pieces.
+
+    Only the stop-path flush can hand us more than MAX_SEG_S. _work_loop caps
+    live phrases, but MODE=single accumulates the entire session by design, and
+    a detector thread that died leaves the buffer growing with nothing draining
+    it -- which is how one GPU failure turned into a 72s chunk on 2026-08-02.
+
+    Cutting on the quietest point near each boundary rather than at a hard index
+    keeps words intact across the seam; a hard cut is the fallback when the
+    speech really is continuous.
+    """
+    max_n = int(MAX_SEG_S * SR)
+    out = []
+    while audio.size > max_n:
+        cut = quietest_cut(audio[:max_n]) or max_n
+        out.append(audio[:cut])
+        audio = audio[cut:]
+    if audio.size:
+        out.append(audio)
+    return out
+
+
 def find_commit_point(audio, speech_seen):
     """Decide whether to cut. Returns (cut_index_or_None, speech_seen).
 
@@ -299,8 +348,48 @@ def make_backend():
     return FasterWhisperBackend(MODEL)
 
 
+class Transcriber:
+    """Owns the active backend and survives its death mid-session.
+
+    The iGPU has no VRAM: OpenVINO's buffers are system RAM that the kernel must
+    pin into the GPU's address space. Under memory pressure that bind fails, the
+    xe driver bans the GPU VM ("VM worker error: -12"), and every later inference
+    raises CL_OUT_OF_RESOURCES. The ban lasts the life of the process, so
+    retrying the same pipeline only re-raises -- the sole recovery is to stop
+    using the GPU. Falling back to CPU costs latency (~19x realtime -> ~5x) and
+    keeps dictation working until the daemon restarts.
+
+    The failed audio is re-run on the new backend rather than dropped, so the
+    phrase that triggered the fallback still gets typed.
+    """
+
+    def __init__(self):
+        self.backend = make_backend()
+        self.lock = threading.Lock()
+
+    @property
+    def label(self):
+        return self.backend.label
+
+    def transcribe(self, audio):
+        try:
+            return self.backend.transcribe(audio)
+        except Exception as exc:
+            with self.lock:
+                if not isinstance(self.backend, OpenVinoBackend):
+                    raise  # already on CPU; nothing left to fall back to
+                print(f"GPU backend died ({exc}); falling back to CPU", flush=True)
+                notify(
+                    "⚠️ GPU transcription failed",
+                    "Switched to the CPU backend for the rest of this session.",
+                    urgency="normal",
+                )
+                self.backend = FasterWhisperBackend(MODEL)
+            return self.backend.transcribe(audio)
+
+
 class Session:
-    """One recording session: reader thread + phrase-committing worker."""
+    """One recording session: reader, phrase detector, and transcriber."""
 
     def __init__(self, backend, notif_id=None):
         self.backend = backend
@@ -309,11 +398,19 @@ class Session:
         self.buf_lock = threading.Lock()
         self.stopping = threading.Event()
         self.spoke = False  # emitted anything yet? controls leading space
+        # Committed phrases waiting to be transcribed. Unbounded on purpose:
+        # dropping queued audio is exactly the data loss this exists to prevent.
+        # Depth stays near zero in practice -- the iGPU runs ~19x realtime and
+        # the CPU fallback ~5x (docs/findings.md), so the queue absorbs bursts
+        # rather than accumulating. _pending() reports the depth for stop().
+        self.queue = queue.Queue()
         self.proc = subprocess.Popen(RECORD_CMD, stdout=subprocess.PIPE)
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.worker = threading.Thread(target=self._work_loop, daemon=True)
+        self.typist = threading.Thread(target=self._transcribe_loop, daemon=True)
         self.reader.start()
         self.worker.start()
+        self.typist.start()
 
     def _read_loop(self):
         while not self.stopping.is_set():
@@ -338,13 +435,23 @@ class Session:
             raw = bytes(self.buf)
         return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-    def _emit(self, audio):
+    def _commit(self, audio):
+        """Hand a finished phrase to the transcriber. Must stay cheap: this runs
+        on the detector thread, and anything slow here delays the *next* phrase
+        boundary rather than the current phrase's text."""
         if audio.size < 0.3 * SR:  # too short to be speech
             return
-        # One VAD pass per commit (not per poll) to avoid paying ~1.5s of
+        # One VAD pass per commit (not per poll) to avoid queueing ~1.5s of
         # transcription on a chunk that turns out to be pure silence.
         if not has_speech(audio):
             return
+        self.queue.put(audio)
+
+    def _pending(self):
+        """Seconds of audio queued but not yet transcribed."""
+        return sum(a.size for a in tuple(self.queue.queue) if a is not None) / SR
+
+    def _emit(self, audio):
         text = self.backend.transcribe(audio)
         if not text:
             return
@@ -355,18 +462,45 @@ class Session:
             target=log_pause_gaps, args=(audio,), daemon=True
         ).start()
 
+    def _transcribe_loop(self):
+        """Drain the phrase queue, one at a time. Single consumer, so phrases
+        are typed in the order they were spoken."""
+        while True:
+            audio = self.queue.get()
+            try:
+                if audio is None:  # stop() has flushed everything
+                    return
+                self._emit(audio)
+            except Exception as exc:
+                # A phrase we cannot transcribe is lost, but the session is not:
+                # keep draining so the rest of what was said still gets typed.
+                print(
+                    f"transcription failed, dropped {audio.size / SR:.1f}s: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                self.queue.task_done()
+
     def _work_loop(self):
         if MODE == "single":
             self.stopping.wait()
             return
         speech_seen = False
         while not self.stopping.wait(POLL_S):
-            audio = self._snapshot()
-            if audio.size < SR:
-                continue
-            cut, speech_seen = find_commit_point(audio, speech_seen)
-            if cut and cut > 0:
-                self._emit(self._take(cut))
+            # Detection must outlive its own failures. When this thread died on
+            # a backend exception, nothing drained self.buf and capture ran on
+            # regardless -- the mic stayed live, the banner stayed up, and not a
+            # word was typed until the daemon was restarted.
+            try:
+                audio = self._snapshot()
+                if audio.size < SR:
+                    continue
+                cut, speech_seen = find_commit_point(audio, speech_seen)
+                if cut and cut > 0:
+                    self._commit(self._take(cut))
+            except Exception as exc:
+                print(f"phrase detection failed: {exc}", file=sys.stderr, flush=True)
 
     def stop(self):
         """Terminate capture and flush whatever speech is left."""
@@ -378,10 +512,26 @@ class Session:
             self.proc.kill()
         self.reader.join(timeout=2)
         self.worker.join(timeout=2)
-        tail = self._take()
-        if tail.size:
+        # The whole remaining buffer, not one phrase: in MODE=single that is the
+        # entire session, and if the detector died it is everything since. Split
+        # it so no piece exceeds what Whisper's 30s window can hold.
+        for chunk in split_for_transcription(self._take()):
+            self._commit(chunk)
+        self.queue.put(None)  # sentinel: drain, then exit
+        backlog = self._pending()
+        if backlog:
             notify("⏳ Transcribing…", replace_id=self.notif_id, urgency="critical")
-            self._emit(tail)
+        # Wait for the backlog at a pessimistic 1x realtime, well under the ~5x
+        # the slower (CPU) backend actually manages. A bounded join means a
+        # wedged backend can't hold the toggle hostage forever; the typist is a
+        # daemon thread and keeps draining if we give up early.
+        self.typist.join(timeout=backlog + 30)
+        if self.typist.is_alive():
+            print(
+                f"still transcribing {self._pending():.1f}s after stop",
+                file=sys.stderr,
+                flush=True,
+            )
         return self.spoke
 
 
@@ -418,7 +568,7 @@ def handle_toggle(backend):
 
 def main():
     print(f"Loading backend={BACKEND} model={MODEL} mode={MODE}…", flush=True)
-    backend = make_backend()
+    backend = Transcriber()
     print(f"Ready: {backend.label}", flush=True)
 
     if os.path.exists(SOCKET_PATH):
