@@ -15,11 +15,15 @@ audio: a reader appends capture to a byte buffer, a detector scans it for phrase
 boundaries and hands each finished phrase off, and a single transcriber drains
 that queue. Only the transcriber types, so phrases land in the order spoken.
 
+The OpenVINO backend additionally runs in a child process, because its failure
+mode is an uncatchable abort rather than an exception -- see _ov_worker.
+
   DICTATE_MODE=phrase  (default) type each phrase as you finish it
   DICTATE_MODE=single            type everything at once when you stop
 """
 
 import functools
+import multiprocessing
 import os
 import queue
 import re
@@ -27,6 +31,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 import numpy as np
 from faster_whisper.vad import VadOptions, get_speech_timestamps
@@ -60,6 +65,14 @@ READ_BYTES = 3200  # 100ms of s16le mono @16k
 # and matches the rate audio actually arrives, so polling faster gains nothing.
 # Cost is one VAD pass over TAIL_MS of audio per tick -- ~1.5ms, ~1.5% of a core.
 POLL_S = 0.1
+
+# How long the parent waits on the GPU child before declaring it dead. Load is
+# generous because a cold child re-imports this module and builds the pipeline
+# (~2s warm, far more if the model files have fallen out of page cache). The
+# call bound only has to exceed a worst-case MAX_SEG_S phrase (~4s measured);
+# anything near a minute means the GPU has wedged rather than slowed.
+GPU_LOAD_TIMEOUT_S = 120
+GPU_CALL_TIMEOUT_S = 60
 
 RECORD_CMD = [
     "parecord",
@@ -364,29 +377,144 @@ class FasterWhisperBackend:
         return " ".join(s.text.strip() for s in segments).strip()
 
 
-class OpenVinoBackend:
-    """iGPU transcription via OpenVINO. ~2.5x faster than the CPU backend.
+class WorkerDied(RuntimeError):
+    """The GPU child process is gone, or has stopped answering."""
 
-    Greedy decoding only: openvino-genai 2026.2.1 cannot run beam search on
-    GPU ("Not Implemented" on remote tensors at num_beams=2, logits/beam batch
-    mismatch at 5). On clean speech that costs about one word error in ninety;
-    in babble it is closer to three. See docs/findings.md.
+
+def _ov_worker(model_dir, device, req_q, res_q):
+    """Child process: owns the OpenVINO pipeline and nothing else.
+
+    Isolation is the whole point of this function existing. When the xe driver
+    bans the GPU VM, OpenVINO tears its command stream down on a background
+    thread whose destructor throws; with no handler on that thread,
+    std::terminate aborts the process. Python never gets a chance to intervene
+    -- an `except` around generate() catches the *first* error and logs a tidy
+    fallback, and the process dies anyway a few seconds later. Reproduced and
+    measured in docs/findings.md.
+
+    So the pipeline lives behind a process boundary. When it aborts, the parent
+    finds a corpse instead of sharing one.
+
+    Nothing here may raise: a traceback escaping this function would kill the
+    worker for reasons the parent would then misread as a GPU fault.
     """
-
-    label = f"openvino {OV_DEVICE} (greedy)"
-
-    def __init__(self, model_dir, device):
+    try:
         import openvino_genai as og
 
+        pipe = og.WhisperPipeline(model_dir, device=device)
+    except BaseException as exc:  # noqa: BLE001 -- report, never propagate
+        res_q.put(("fatal", f"{type(exc).__name__}: {exc}"))
+        return
+
+    res_q.put(("ready", None))
+    while True:
+        audio = req_q.get()
+        if audio is None:  # parent is shutting us down
+            return
+        try:
+            res_q.put(("ok", pipe.generate(audio).texts[0].strip()))
+        except BaseException as exc:  # noqa: BLE001
+            res_q.put(("err", f"{type(exc).__name__}: {exc}"))
+
+
+class OpenVinoBackend:
+    """iGPU transcription via OpenVINO, running in a child process.
+
+    ~2.5x faster than the CPU backend. Greedy decoding only: openvino-genai
+    2026.2.1 cannot run beam search on GPU ("Not Implemented" on remote tensors
+    at num_beams=2, logits/beam batch mismatch at 5). On clean speech that costs
+    about one word error in ninety; in babble it is closer to three.
+
+    The parent must never import openvino itself. Touching the GPU from this
+    process would put the abort back in the one place we are protecting.
+
+    Requests are strictly one at a time -- a single transcriber thread drives
+    this -- so a plain request/response pair over two queues is enough, with no
+    correlation ids. Any desync means the worker is being discarded anyway.
+    """
+
+    label = f"openvino {OV_DEVICE} (greedy, isolated)"
+
+    def __init__(self, model_dir, device):
         if not os.path.isdir(model_dir):
             raise RuntimeError(
                 f"OpenVINO model not found at {model_dir}. "
                 "Run install.sh with DICTATE_BACKEND=openvino."
             )
-        self.pipe = og.WhisperPipeline(model_dir, device=device)
+        self.model_dir, self.device = model_dir, device
+        self._start()
+
+    def _start(self):
+        # spawn, not fork: a forked child would inherit this process's threads
+        # and allocator state, and we want the GPU stack built from clean.
+        ctx = multiprocessing.get_context("spawn")
+        self.req_q, self.res_q = ctx.Queue(), ctx.Queue()
+        self.proc = ctx.Process(
+            target=_ov_worker,
+            args=(self.model_dir, self.device, self.req_q, self.res_q),
+            daemon=True,  # never outlive the daemon
+        )
+        self.proc.start()
+        kind, payload = self._await(GPU_LOAD_TIMEOUT_S)
+        if kind != "ready":
+            self.close()
+            raise RuntimeError(payload or "GPU worker failed to start")
+
+    def _await(self, timeout):
+        """Wait for the worker's reply, watching for its death as well.
+
+        Polling rather than a bare blocking get: an aborted worker sends
+        nothing, so a plain get(timeout=...) would stall for the full timeout on
+        the common failure. Checking is_alive() between short waits turns a
+        SIGABRT into an immediate WorkerDied.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return self.res_q.get(timeout=0.2)
+            except queue.Empty:
+                pass
+            if not self.proc.is_alive():
+                # -6 is SIGABRT, the signature of the GPU VM ban.
+                raise WorkerDied(f"worker exited with code {self.proc.exitcode}")
+            if time.monotonic() >= deadline:
+                raise WorkerDied(f"worker silent for {timeout:.0f}s")
 
     def transcribe(self, audio):
-        return self.pipe.generate(audio).texts[0].strip()
+        try:
+            self.req_q.put(audio)
+        except Exception as exc:
+            raise WorkerDied(f"could not reach worker: {exc}") from exc
+        kind, payload = self._await(GPU_CALL_TIMEOUT_S)
+        if kind == "ok":
+            return payload
+        # The worker answered but the GPU refused. In the observed failure the
+        # first symptom is exactly this -- a catchable CL error -- and the abort
+        # follows moments later, so treat it as fatal to the worker, not as a
+        # bad phrase.
+        raise WorkerDied(payload)
+
+    def restart(self):
+        self.close()
+        self._start()
+
+    def close(self):
+        """Tear the worker down. Must never raise: every caller is already on a
+        failure path."""
+        proc = getattr(self, "proc", None)
+        if proc is None:
+            return
+        try:
+            if proc.is_alive():
+                self.req_q.put(None)
+                proc.join(timeout=2)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2)
+            if proc.is_alive():
+                proc.kill()
+        except Exception:
+            pass
 
 
 def make_backend():
@@ -409,12 +537,15 @@ class Transcriber:
     """Owns the active backend and survives its death mid-session.
 
     The iGPU has no VRAM: OpenVINO's buffers are system RAM that the kernel must
-    pin into the GPU's address space. Under memory pressure that bind fails, the
-    xe driver bans the GPU VM ("VM worker error: -12"), and every later inference
-    raises CL_OUT_OF_RESOURCES. The ban lasts the life of the process, so
-    retrying the same pipeline only re-raises -- the sole recovery is to stop
-    using the GPU. Falling back to CPU costs latency (~19x realtime -> ~5x) and
-    keeps dictation working until the daemon restarts.
+    pin into the GPU's address space. Under memory pressure that bind fails and
+    the xe driver bans the GPU VM ("VM worker error: -12").
+
+    The ban is scoped to the process holding the VM -- which, since the pipeline
+    moved into a child, is no longer this one. That buys a recovery the old
+    in-process design could not have: a *fresh* worker gets a fresh VM and
+    usually comes back on the GPU. Worth one attempt, because the CPU backend
+    costs ~2.2x per phrase. If the replacement dies too, the machine genuinely
+    has no room for the iGPU and we stop asking for the rest of the session.
 
     The failed audio is re-run on the new backend rather than dropped, so the
     phrase that triggered the fallback still gets typed.
@@ -423,26 +554,44 @@ class Transcriber:
     def __init__(self):
         self.backend = make_backend()
         self.lock = threading.Lock()
+        self.gpu_retried = False
 
     @property
     def label(self):
         return self.backend.label
 
     def transcribe(self, audio):
-        try:
-            return self.backend.transcribe(audio)
-        except Exception as exc:
-            with self.lock:
-                if not isinstance(self.backend, OpenVinoBackend):
-                    raise  # already on CPU; nothing left to fall back to
-                print(f"GPU backend died ({exc}); falling back to CPU", flush=True)
-                notify(
-                    "⚠️ GPU transcription failed",
-                    "Switched to the CPU backend for the rest of this session.",
-                    urgency="normal",
-                )
-                self.backend = FasterWhisperBackend(MODEL)
-            return self.backend.transcribe(audio)
+        # Loops rather than retrying once: the replacement may itself be a GPU
+        # worker that fails immediately. _replace() gives up the GPU on the
+        # second failure, so this terminates on the CPU backend at worst.
+        while True:
+            try:
+                return self.backend.transcribe(audio)
+            except Exception as exc:
+                with self.lock:
+                    if not isinstance(self.backend, OpenVinoBackend):
+                        raise  # already on CPU; nothing left to fall back to
+                    self.backend = self._replace(self.backend, exc)
+
+    def _replace(self, dead, exc):
+        """Swap in a working backend after a GPU failure. Caller holds the lock."""
+        print(f"GPU worker failed ({exc})", file=sys.stderr, flush=True)
+        if not self.gpu_retried:
+            self.gpu_retried = True
+            try:
+                dead.restart()
+                print("restarted the GPU worker", flush=True)
+                return dead
+            except Exception as exc2:
+                print(f"GPU worker restart failed ({exc2})", file=sys.stderr,
+                      flush=True)
+        dead.close()
+        notify(
+            "⚠️ GPU transcription failed",
+            "Switched to the CPU backend for the rest of this session.",
+            urgency="normal",
+        )
+        return FasterWhisperBackend(MODEL)
 
 
 class Session:
