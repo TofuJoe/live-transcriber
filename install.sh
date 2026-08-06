@@ -18,6 +18,14 @@ BACKEND="${DICTATE_BACKEND:-faster-whisper}"   # faster-whisper | openvino
 OV_DEVICE="${DICTATE_OV_DEVICE:-GPU}"          # GPU | CPU | HETERO:GPU,CPU
 OV_REPO="OpenVINO/whisper-small.en-int8-ov"
 
+# Memory reservation for the daemon. Sized from observed usage: 514MB RSS
+# fresh, 723MB cgroup current, 913MB peak. SESSION_MIN is what uresourced
+# already gave session.slice; ACTIVE_USER_MIN must cover both children.
+MEM_MIN="${DICTATE_MEMORY_MIN:-900M}"
+MEM_LOW="${DICTATE_MEMORY_LOW:-1200M}"
+SESSION_MIN="${DICTATE_SESSION_MIN:-250M}"
+ACTIVE_USER_MIN="${DICTATE_ACTIVE_USER_MIN:-1300M}"
+
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
@@ -93,6 +101,77 @@ sed -e "s/@MODEL@/$MODEL/" -e "s/@MODE@/$MODE/" \
     -e "s/@BACKEND@/$BACKEND/" -e "s|@OV_DEVICE@|$OV_DEVICE|" \
   "$REPO/systemd/dictation.service" > "$UNIT/dictation.service"
 
+# ---------------------------------------------------- memory protection
+# The daemon holds a ~500MB model resident. Unprotected it gets reclaimed under
+# memory pressure (248.9MB swapped out in a 22-minute run), which for the
+# OpenVINO backend is fatal rather than merely slow: the iGPU has no VRAM, so
+# its buffers are system RAM the kernel must pin, and a failed pin makes the xe
+# driver ban the GPU VM. See docs/findings.md.
+#
+# cgroup v2 caps memory.min at every ancestor, so all three levels must move --
+# service, app.slice, and the active-user reservation. Setting only the service
+# does nothing at all.
+say "Reserving memory for the daemon (MemoryMin=$MEM_MIN)"
+mkdir -p "$UNIT/dictation.service.d" "$UNIT/app.slice.d"
+sed -e "s/@MEM_MIN@/$MEM_MIN/" -e "s/@MEM_LOW@/$MEM_LOW/" \
+  "$REPO/systemd/dictation-memory.conf" > "$UNIT/dictation.service.d/50-memory.conf"
+sed -e "s/@MEM_MIN@/$MEM_MIN/" \
+  "$REPO/systemd/app-slice-memory.conf" > "$UNIT/app.slice.d/50-dictation-memory.conf"
+
+if [[ -f /etc/uresourced.conf ]]; then
+  # uresourced owns user@.service's memory.min and rewrites it on session
+  # changes, so `systemctl set-property` would not survive. Its config is the
+  # only durable lever, and it has no drop-in directory.
+  say "Raising the uresourced active-user reservation to $ACTIVE_USER_MIN"
+  sudo python3 - "$ACTIVE_USER_MIN" "$SESSION_MIN" <<'PY'
+import pathlib, re, shutil, sys
+
+active, session = sys.argv[1], sys.argv[2]
+path = pathlib.Path("/etc/uresourced.conf")
+backup = pathlib.Path("/etc/uresourced.conf.pre-dictation")
+if not backup.exists():
+    shutil.copy2(path, backup)
+
+
+def set_key(text, section, key, value):
+    """Set key=value within [section], leaving comments and other keys alone."""
+    lines = text.splitlines()
+    try:
+        start = next(i for i, l in enumerate(lines) if l.strip() == section)
+    except StopIteration:
+        return text.rstrip("\n") + f"\n\n{section}\n{key}={value}\n"
+    end = next((j for j in range(start + 1, len(lines))
+                if lines[j].lstrip().startswith("[")), len(lines))
+    for j in range(start + 1, end):
+        # Matches the commented-out defaults too, which is how SessionSlice
+        # ships -- it must be set explicitly or it inherits ActiveUser.
+        if re.match(rf"\s*#?\s*{key}\s*=", lines[j]):
+            lines[j] = f"{key}={value}"
+            break
+    else:
+        lines.insert(start + 1, f"{key}={value}")
+    return "\n".join(lines) + "\n"
+
+
+text = path.read_text()
+text = set_key(text, "[ActiveUser]", "MemoryMin", active)
+# [SessionSlice] defaults to [ActiveUser]. Without an explicit value it
+# inherits the raise and swallows the whole reservation, leaving app.slice at
+# zero -- the exact state this is meant to fix.
+text = set_key(text, "[SessionSlice]", "MemoryMin", session)
+path.write_text(text)
+PY
+  sudo systemctl restart uresourced
+else
+  # No uresourced: nothing sets user@.service's memory.min, so it defaults to
+  # 0 and would cap everything below it.
+  say "uresourced not present; reserving via user@$(id -u).service directly"
+  sudo mkdir -p "/etc/systemd/system/user@$(id -u).service.d"
+  printf '[Service]\nMemoryMin=%s\n' "$ACTIVE_USER_MIN" \
+    | sudo tee "/etc/systemd/system/user@$(id -u).service.d/50-dictation-memory.conf" >/dev/null
+  sudo systemctl daemon-reload
+fi
+
 # --------------------------------------------------------------- hotkey
 say "Binding hotkey: $HOTKEY"
 KEYPATH=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dictation/
@@ -115,6 +194,21 @@ say "Starting dictation daemon (first run downloads the model)"
 systemctl --user daemon-reload
 systemctl --user enable --now dictation.service
 systemctl --user restart dictation.service
+
+# Confirm the reservation survived the cgroup hierarchy. Worth checking rather
+# than assuming: the failure mode is silent -- every level accepts the setting
+# and the effective value is still 0 if any ancestor caps it.
+UID_N="$(id -u)"
+CG="/sys/fs/cgroup/user.slice/user-$UID_N.slice/user@$UID_N.service/app.slice/dictation.service/memory.min"
+if [[ -r "$CG" ]]; then
+  eff=$(<"$CG")
+  if [[ "$eff" == "0" ]]; then
+    say "warning: memory reservation is not in effect (memory.min=0)."
+    say "         an ancestor cgroup is capping it; see docs/findings.md"
+  else
+    say "Memory reserved: $((eff / 1024 / 1024))MB protected from reclaim"
+  fi
+fi
 
 for _ in $(seq 1 60); do
   if journalctl --user -u dictation.service --since "-2min" 2>/dev/null | grep -q "Listening on"; then
