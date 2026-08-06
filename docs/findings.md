@@ -294,6 +294,134 @@ lower power, not dramatically faster — Xe shares memory bandwidth with the CPU
 
 ---
 
+## iGPU reliability — the VM ban, and why the in-process fallback never worked
+
+Investigated 2026-08-04 after dictation went silent mid-session. Worth reading
+before touching `Transcriber`: the original design here was wrong in a way that
+looked right in the logs.
+
+### Symptom
+
+```
+22:47:40  kernel: xe 0000:00:02.0: [drm] VM worker error: -12
+22:47:40  kernel: xe 0000:00:02.0: [drm] Trying to schedule after vm is closed or banned
+22:47:41  python: GPU backend died (...); falling back to CPU
+22:47:55  systemd: Main process exited, code=dumped, status=6/ABRT
+22:47:58  systemd: Started dictation.service
+```
+
+The fallback fires and logs the right thing. **Then the process dies anyway,
+14 seconds later.** systemd restarts it, but the live `Session` goes with it —
+the recording, the "Listening…" banner, and every phrase queued in
+`self.queue`. From the user's seat dictation simply stops, which reads as
+"transcription is taking way too long" rather than as a crash.
+
+Not a one-off: same `-12` on 2026-08-02 21:44, followed by restarts at 21:50,
+22:01, 22:06 and 22:17.
+
+### Root cause
+
+`-12` is `ENOMEM`. The iGPU has no VRAM, so OpenVINO's buffers are system RAM
+the kernel must pin into the GPU's address space; under memory pressure that
+bind fails and the `xe` driver bans the VM.
+
+The abort is the interesting part. Reproduced by running `generate()` in a loop:
+
+```
+RuntimeError: ... clWaitForEvents, error code: -14 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
+terminate called after throwing an instance of 'ov::Exception'
+  what(): ... [GPU] clFinish, error code: -5 CL_OUT_OF_RESOURCES
+→ core dumped
+```
+
+Two distinct events. Python sees the **first** — a catchable `RuntimeError` —
+and the `except` in `Transcriber.transcribe` handles it correctly. OpenVINO then
+tears its command stream down on a **background thread**, that destructor throws
+with no handler on the thread, and `std::terminate` aborts the process.
+
+> **No Python `except` can catch a C++ exception on a thread you don't own.**
+> The old docstring's claim — "the sole recovery is to stop using the GPU …
+> falling back to CPU keeps dictation working" — was untestable optimism. The
+> fallback ran to completion and the process died regardless.
+
+A catchable error from the GPU is therefore not a bad phrase, it is the first
+symptom of a dying context. `OpenVinoBackend.transcribe` treats it as fatal to
+the worker.
+
+### Fix: a process boundary
+
+The pipeline moved into a spawned child (`_ov_worker`). The parent never imports
+`openvino` — doing so would put the abort back in the process being protected.
+
+Verified by sending the child `SIGABRT`, the exact signal from the incident:
+
+| | before | after |
+|---|---|---|
+| daemon survives | no — `status=6/ABRT` | **yes** |
+| live session survives | no | yes |
+| queued phrases | lost | typed |
+| detection | n/a | `WorkerDied: exit code -6` in **2.4s** |
+| the failed phrase | lost | re-run on the replacement |
+
+Detection polls `is_alive()` between short queue waits rather than blocking on
+`get(timeout=…)`. An aborted worker sends *nothing*, so a bare blocking get
+would stall for the full 60s timeout on the most common failure.
+
+**The ban is per-process**, which is a recovery the old design could not have
+had: a fresh worker gets a fresh VM and usually comes back on the GPU. So the
+policy is restart-once, then CPU permanently — one retry is worth it at ~2.2x
+per phrase, and a second failure means the machine genuinely has no room.
+
+### The other half: stop losing the pages
+
+Isolation makes the ban survivable; it doesn't make it rarer. The trigger was
+ordinary memory pressure, and the daemon had **no protection from reclaim** —
+`MemoryMin=0`, with 248.9MB swapped out in a 22-minute run.
+
+`memory.min` is capped by every ancestor cgroup, so a drop-in on
+`dictation.service` alone is **inert**. All of these had to move:
+
+| cgroup | before | after |
+|---|---|---|
+| `user@1000.service` | 250M | 1300M |
+| ` ├─ session.slice` | 250M *(claimed all of it)* | 250M |
+| ` └─ app.slice` | **0** | 900M |
+| `    └─ dictation.service` | **0** | **900M** |
+
+The top three are owned by `uresourced` (`/etc/uresourced.conf`), not systemd
+units. `[SessionSlice]` **defaults to `[ActiveUser]`**, so raising the ceiling
+alone does nothing — session.slice inherits the increase and swallows it. It
+must be pinned explicitly.
+
+Sized from observed usage: 514MB RSS fresh, 723MB cgroup current, 913MB peak.
+
+`MemoryLow` is set on the leaf but is currently **inert** — uresourced pins
+`memory.low` to 0 up the chain, so nothing propagates. `MemoryMin` does the real
+work; the `MemoryLow` line is intent, not effect.
+
+### Non-finding: there is no memory leak
+
+The pre-crash process showed a 1.6GB peak against 514MB fresh, which looked like
+a leak and is not one. 40 sequential `generate()` calls:
+
+```
+after warm-up:  anon = 310.0 MB
+  iter   5:     anon = 319.4 MB (+9.4)
+  iter  20:     anon = 319.5 MB (+9.5)
+```
+
+One-time +9.5MB, then flat. The 1.6GB is `MemoryPeak` counting **page cache**
+(360MB of model file cache at a fresh start alone) plus the ~500MB FasterWhisper
+model loaded during the failed fallback. Rules out a fast leak; 20 iterations
+can't rule out a very slow one.
+
+**Harness caveat, per the discipline section below:** the loop that reproduced
+the abort held a *second* copy of the model on the iGPU alongside the running
+daemon's, roughly doubling GPU memory demand. It is good evidence for the abort
+*mechanism*, not evidence that the daemon alone fails at ~20 phrases.
+
+---
+
 ## Power
 
 Measured via Intel RAPL package energy (requires root).
