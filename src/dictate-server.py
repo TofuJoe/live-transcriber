@@ -86,6 +86,13 @@ STREAM_MIN_S = 1.0  # too little audio to be worth a pass
 # at ~2s chunks, 0 at ~20s). Here a pause is ignored until the window is already
 # long enough to decode well, so clauses accumulate instead of being isolated.
 STREAM_FLUSH_S = 12
+# Words held back from the agreed prefix while the window is still open.
+# Agreement means "two passes settled on this independently", but consecutive
+# passes only differ by ~0.5s of audio, and the last word of a hypothesis is the
+# one that has heard least of what follows it -- exactly the word that turns
+# 'bye' into 'by' once the next one arrives. Holding one back costs a word of
+# lag and buys the guarantee the mode exists for. The flush emits it.
+STREAM_HOLDBACK = 1
 
 RECORD_CMD = [
     "parecord",
@@ -374,6 +381,30 @@ def _agreement_key(word):
     return word.strip(".,!?;:-\"'").lower()
 
 
+def resume_point(hyp, typed):
+    """Where to pick up in `hyp` given `typed` has already been sent.
+
+    Indices are not safe to carry across decodes. Each pass re-segments what it
+    hears -- the same speech comes back as a different number of words when
+    punctuation shifts or a compound splits -- so hyp[len(typed):] silently
+    repeats or drops text once the count moves. Measured: a 21-word passage
+    typed as 23-24 words, with "to the harbor" emitted twice.
+
+    Anchoring on the tail we actually typed survives re-segmentation, because it
+    matches on content rather than position. Searching backwards takes the
+    latest occurrence, so a phrase the speaker genuinely repeated resumes after
+    the second one rather than replaying it.
+    """
+    if not typed:
+        return 0
+    anchor = [_agreement_key(w) for w in typed[-4:]]
+    keys = [_agreement_key(w) for w in hyp]
+    for start in range(len(keys) - len(anchor), -1, -1):
+        if keys[start:start + len(anchor)] == anchor:
+            return start + len(anchor)
+    return len(typed)  # anchor gone entirely; index is the least-bad guess
+
+
 def agreed_prefix(hyp, prev):
     """How many leading words two consecutive hypotheses agree on.
 
@@ -654,7 +685,7 @@ class Session:
         # MODE=stream state. Words of the current window already typed, and
         # whether this window has heard speech yet -- the same bit find_commit_point
         # carries as `speech_seen`, for the same reason.
-        self.streamed = 0
+        self.streamed = []  # words typed from the current window, in order
         self.stream_heard = False
         self.proc = subprocess.Popen(RECORD_CMD, stdout=subprocess.PIPE)
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -755,6 +786,7 @@ class Session:
             return
         type_text((" " if self.spoke else "") + " ".join(words))
         self.spoke = True
+        self.streamed.extend(words)  # the anchor resume_point aligns against
 
     def _stream_loop(self):
         """Re-decode a growing window and commit only what has stopped changing.
@@ -795,6 +827,22 @@ class Session:
                         continue
                     self.stream_heard = True
 
+                # A pause only ends the window once there is enough audio to
+                # have decoded well; shorter pauses are deliberately ignored.
+                tail_quiet = not has_speech(audio[-tail_n:])
+                ended = tail_quiet and audio.size >= STREAM_FLUSH_S * SR
+                full = audio.size >= MAX_SEG_S * SR
+
+                if tail_quiet and not (ended or full):
+                    # Paused mid-thought, window too short to close. Decoding
+                    # again would spend the GPU on audio that hasn't changed,
+                    # and worse, the identical hypothesis would come back and
+                    # look like agreement -- the same guess counted twice rather
+                    # than two passes that independently settled. That is how a
+                    # pause used to commit a trailing word early, undoing the
+                    # context this mode exists to preserve. Wait for speech.
+                    continue
+
                 t0 = time.monotonic()
                 hyp = self.backend.transcribe(audio).split()
                 decode_s = time.monotonic() - t0
@@ -803,30 +851,24 @@ class Session:
                 # text falls further behind the speaker the longer they talk.
                 print(
                     f"stream window={audio.size / SR:.1f}s decode={decode_s * 1000:.0f}ms "
-                    f"committed={self.streamed}/{len(hyp)}",
+                    f"committed={len(self.streamed)}/{len(hyp)}",
                     flush=True,
                 )
 
-                # A pause only ends the window once there is enough audio to
-                # have decoded well; short pauses are deliberately ignored.
-                ended = (
-                    audio.size >= STREAM_FLUSH_S * SR
-                    and not has_speech(audio[-tail_n:])
-                )
-                if ended or audio.size >= MAX_SEG_S * SR:
+                start = resume_point(hyp, self.streamed)
+                if ended or full:
                     # Window is closed, so the hypothesis is final rather than
                     # provisional: commit all of it, not just the agreed prefix.
                     # Take exactly what we decoded -- the reader has appended
                     # more since the snapshot, and that belongs to the next one.
-                    self._say(hyp[self.streamed:])
+                    self._say(hyp[start:])
                     self._take(audio.size)
-                    prev, self.streamed, self.stream_heard = [], 0, False
+                    prev, self.streamed, self.stream_heard = [], [], False
                     continue
 
-                n = agreed_prefix(hyp, prev)
-                if n > self.streamed:
-                    self._say(hyp[self.streamed:n])
-                    self.streamed = n
+                n = agreed_prefix(hyp, prev) - STREAM_HOLDBACK
+                if n > start:
+                    self._say(hyp[start:n])
                 prev = hyp
             except Exception as exc:
                 print(f"stream loop failed: {exc}", file=sys.stderr, flush=True)
@@ -838,13 +880,16 @@ class Session:
         the buffer is final and nothing races us for it.
         """
         audio = self._take()
-        skip = self.streamed  # already typed; only the first chunk can overlap
+        first = True
         for chunk in split_for_transcription(audio):
             if chunk.size < 0.3 * SR or not has_speech(chunk):
                 continue
-            self._say(self.backend.transcribe(chunk).split()[skip:])
-            skip = 0
-        self.streamed = 0
+            words = self.backend.transcribe(chunk).split()
+            # Only the first chunk overlaps text already typed; later chunks are
+            # audio this session has never decoded, so they start at zero.
+            self._say(words[resume_point(words, self.streamed) if first else 0:])
+            first = False
+        self.streamed = []
 
     def _work_loop(self):
         if MODE == "single":
