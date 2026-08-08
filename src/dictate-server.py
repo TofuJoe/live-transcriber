@@ -20,6 +20,7 @@ mode is an uncatchable abort rather than an exception -- see _ov_worker.
 
   DICTATE_MODE=phrase  (default) type each phrase as you finish it
   DICTATE_MODE=single            type everything at once when you stop
+  DICTATE_MODE=stream            LocalAgreement -- see _stream_loop
 """
 
 import functools
@@ -73,6 +74,18 @@ POLL_S = 0.1
 # anything near a minute means the GPU has wedged rather than slowed.
 GPU_LOAD_TIMEOUT_S = 120
 GPU_CALL_TIMEOUT_S = 60
+
+# ---------------------------------------------------------- MODE=stream
+# Floor between re-transcriptions. Usually not the binding constraint: a pass
+# over the window costs more than this, and the loop paces itself on that.
+STREAM_TICK_S = 0.5
+STREAM_MIN_S = 1.0  # too little audio to be worth a pass
+# How much audio must accumulate before a silence is allowed to end the window.
+# This is the whole point of the mode: in phrase mode *any* TAIL_MS pause cuts,
+# which is what starves the decoder of context (measured: 4 errors in 71 words
+# at ~2s chunks, 0 at ~20s). Here a pause is ignored until the window is already
+# long enough to decode well, so clauses accumulate instead of being isolated.
+STREAM_FLUSH_S = 12
 
 RECORD_CMD = [
     "parecord",
@@ -350,6 +363,34 @@ def find_commit_point(audio, speech_seen):
     return (cut if cut > 0 else None), False
 
 
+def _agreement_key(word):
+    """Compare words ignoring punctuation and case.
+
+    Whisper re-punctuates as its window grows -- "words" becomes "words," once a
+    following clause arrives, and a fragment that looked like a sentence loses
+    its capital. Comparing raw strings would treat that as disagreement and stall
+    the commit prefix on text the model never actually reconsidered.
+    """
+    return word.strip(".,!?;:-\"'").lower()
+
+
+def agreed_prefix(hyp, prev):
+    """How many leading words two consecutive hypotheses agree on.
+
+    This is LocalAgreement-2: a word is committed once it has survived one
+    re-decode with more audio behind it. Whisper revises the tail of its output
+    as context arrives and leaves the head alone, so agreement across two passes
+    is a good proxy for "this will not change again" -- which is the only
+    guarantee that matters here, because typed keystrokes cannot be recalled.
+    """
+    n = 0
+    for a, b in zip(hyp, prev):
+        if _agreement_key(a) != _agreement_key(b):
+            break
+        n += 1
+    return n
+
+
 class FasterWhisperBackend:
     """CPU transcription via CTranslate2. Slower, but supports beam search,
     which is worth a few real word errors per hundred in noisy audio."""
@@ -610,13 +651,28 @@ class Session:
         # the CPU fallback ~5x (docs/findings.md), so the queue absorbs bursts
         # rather than accumulating. _pending() reports the depth for stop().
         self.queue = queue.Queue()
+        # MODE=stream state. Words of the current window already typed, and
+        # whether this window has heard speech yet -- the same bit find_commit_point
+        # carries as `speech_seen`, for the same reason.
+        self.streamed = 0
+        self.stream_heard = False
         self.proc = subprocess.Popen(RECORD_CMD, stdout=subprocess.PIPE)
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
-        self.worker = threading.Thread(target=self._work_loop, daemon=True)
-        self.typist = threading.Thread(target=self._transcribe_loop, daemon=True)
+        # stream transcribes and types on its own thread, so it needs no queue
+        # and no typist: it is already a single consumer, and pacing the loop on
+        # the decode is what keeps the window from outrunning the GPU.
+        self.worker = threading.Thread(
+            target=self._stream_loop if MODE == "stream" else self._work_loop,
+            daemon=True,
+        )
+        self.typist = (
+            None if MODE == "stream"
+            else threading.Thread(target=self._transcribe_loop, daemon=True)
+        )
         self.reader.start()
         self.worker.start()
-        self.typist.start()
+        if self.typist:
+            self.typist.start()
 
     def _read_loop(self):
         while not self.stopping.is_set():
@@ -653,6 +709,11 @@ class Session:
             return
         self.queue.put(audio)
 
+    def _pending_stream_audio(self):
+        """Is there enough left in the buffer that the flush will take a moment?"""
+        with self.buf_lock:
+            return len(self.buf) / 2 > STREAM_MIN_S * SR
+
     def _pending(self):
         """Seconds of audio queued but not yet transcribed."""
         return sum(a.size for a in tuple(self.queue.queue) if a is not None) / SR
@@ -688,6 +749,103 @@ class Session:
             finally:
                 self.queue.task_done()
 
+    def _say(self, words):
+        """Type newly committed words. Append-only: this never revises."""
+        if not words:
+            return
+        type_text((" " if self.spoke else "") + " ".join(words))
+        self.spoke = True
+
+    def _stream_loop(self):
+        """Re-decode a growing window and commit only what has stopped changing.
+
+        Phrase mode cuts at every TAIL_MS pause and decodes each ~2s fragment
+        alone, which is where the word errors come from -- 'by Thursday' becomes
+        'Bye Thursday' because nothing in the fragment says otherwise. Here the
+        audio simply accumulates, so by the time a word is committed the decoder
+        has seen the clauses either side of it.
+
+        Committing the agreed prefix rather than the whole hypothesis is what
+        makes that safe to type live. The tail of a Whisper hypothesis churns as
+        context arrives; the head does not. Emitting only the part that survived
+        a second pass keeps the stream append-only, which is the constraint this
+        daemon cannot break -- we inject keystrokes into windows we don't own and
+        cannot backspace over what we can't see.
+
+        Cost: the GPU runs continuously while you speak instead of once per
+        phrase. That is the real price of this mode, and the reason it is opt-in.
+        """
+        prev = []
+        tail_n = int(TAIL_MS / 1000 * SR)
+        while not self.stopping.wait(STREAM_TICK_S):
+            # As in _work_loop: this thread must outlive its own failures, or
+            # capture runs on with nothing draining it and nothing is ever typed.
+            try:
+                audio = self._snapshot()
+                if audio.size < STREAM_MIN_S * SR:
+                    continue
+
+                if not self.stream_heard:
+                    # Full scan only until speech is confirmed. After that the
+                    # tail check below is enough, so the O(n) pass doesn't run
+                    # every tick on a growing buffer.
+                    if not has_speech(audio):
+                        if audio.size > 3 * SR:  # keep silence from accumulating
+                            self._take(audio.size - tail_n)
+                        continue
+                    self.stream_heard = True
+
+                t0 = time.monotonic()
+                hyp = self.backend.transcribe(audio).split()
+                decode_s = time.monotonic() - t0
+                # The number that decides whether this mode is usable: a pass
+                # must stay well under the audio it covers, or the committed
+                # text falls further behind the speaker the longer they talk.
+                print(
+                    f"stream window={audio.size / SR:.1f}s decode={decode_s * 1000:.0f}ms "
+                    f"committed={self.streamed}/{len(hyp)}",
+                    flush=True,
+                )
+
+                # A pause only ends the window once there is enough audio to
+                # have decoded well; short pauses are deliberately ignored.
+                ended = (
+                    audio.size >= STREAM_FLUSH_S * SR
+                    and not has_speech(audio[-tail_n:])
+                )
+                if ended or audio.size >= MAX_SEG_S * SR:
+                    # Window is closed, so the hypothesis is final rather than
+                    # provisional: commit all of it, not just the agreed prefix.
+                    # Take exactly what we decoded -- the reader has appended
+                    # more since the snapshot, and that belongs to the next one.
+                    self._say(hyp[self.streamed:])
+                    self._take(audio.size)
+                    prev, self.streamed, self.stream_heard = [], 0, False
+                    continue
+
+                n = agreed_prefix(hyp, prev)
+                if n > self.streamed:
+                    self._say(hyp[self.streamed:n])
+                    self.streamed = n
+                prev = hyp
+            except Exception as exc:
+                print(f"stream loop failed: {exc}", file=sys.stderr, flush=True)
+
+    def _stream_flush(self):
+        """Type whatever the last window had not committed yet.
+
+        Runs on the stop path once the reader and stream threads are joined, so
+        the buffer is final and nothing races us for it.
+        """
+        audio = self._take()
+        skip = self.streamed  # already typed; only the first chunk can overlap
+        for chunk in split_for_transcription(audio):
+            if chunk.size < 0.3 * SR or not has_speech(chunk):
+                continue
+            self._say(self.backend.transcribe(chunk).split()[skip:])
+            skip = 0
+        self.streamed = 0
+
     def _work_loop(self):
         if MODE == "single":
             self.stopping.wait()
@@ -718,6 +876,17 @@ class Session:
             self.proc.kill()
         self.reader.join(timeout=2)
         self.worker.join(timeout=2)
+        if MODE == "stream":
+            # No queue to drain -- the stream thread transcribes inline -- so the
+            # tail is just whatever it hadn't committed when the hotkey landed.
+            if self._pending_stream_audio():
+                notify("⏳ Transcribing…", replace_id=self.notif_id,
+                       urgency="critical")
+            try:
+                self._stream_flush()
+            except Exception as exc:
+                print(f"stream flush failed: {exc}", file=sys.stderr, flush=True)
+            return self.spoke
         # The whole remaining buffer, not one phrase: in MODE=single that is the
         # entire session, and if the detector died it is everything since. Split
         # it so no piece exceeds what Whisper's 30s window can hold.
@@ -749,6 +918,8 @@ def handle_toggle(backend):
             hint = (
                 f"Speak — text appears as you pause. {hk} to stop."
                 if MODE == "phrase"
+                else f"Speak — text appears as you talk. {hk} to stop."
+                if MODE == "stream"
                 else f"Press {hk} again to transcribe."
             )
             # critical so GNOME keeps it on screen for the whole session --

@@ -74,17 +74,56 @@ systemctl --user restart dictation
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DICTATE_BACKEND` | `faster-whisper` | `openvino` runs on the Intel iGPU |
+| `DICTATE_BACKEND` | `openvino` | Intel iGPU; `faster-whisper` is CPU-only |
 | `DICTATE_OV_DEVICE` | `GPU` | `CPU` or `HETERO:GPU,CPU` also work |
 | `DICTATE_MODEL` | `small.en` | `base.en` is ~2.6x faster, less accurate |
-| `DICTATE_MODE` | `phrase` | `single` types everything at once on stop |
+| `DICTATE_MODE` | `phrase` | `stream` is more accurate; `single` waits until stop |
+
+### Choosing a mode
+
+| Mode | Feedback | Context per decode | GPU load |
+|---|---|---|---|
+| `phrase` (default) | per pause | ~2s | one pass per phrase |
+| `stream` | per word | up to 25s | continuous while speaking |
+| `single` | none until stop | up to 25s | one pass per 25s at stop |
+
+**Chunking, not the decoder, is the main source of word errors.** `phrase` cuts
+at every pause and decodes each ~2s fragment with nothing around it, so `by
+Thursday` comes out `Bye Thursday` and `on short phrases` becomes `A short
+phrase is` — the fragment contains nothing that would rule them out. Measured on
+one 36s passage, same backend and audio throughout:
+
+| Mode | Word errors |
+|---|---|
+| `phrase` | 5/71 — 7.0% |
+| `stream` | **1/71 — 1.4%** |
+| `single` | 0/71 — 0.0% |
+
+`stream` re-decodes a growing window and types each word once it has survived a
+second pass (LocalAgreement-2), so it gets `single`'s context while still typing
+as you talk. Because committed text is never revised, it stays safe to inject
+into windows we don't own.
+
+The cost is power: the GPU decodes continuously while you speak rather than once
+per phrase. `phrase` remains the default for that reason.
+
+```sh
+dictate-mode status    # which mode is live
+dictate-mode stream    # accurate, live feedback, continuous GPU
+dictate-mode phrase    # back to the low-power default
+```
+
+Post-processing the *text* cannot substitute for this: every one of those
+substitutions is a correctly-spelled English word (`hunspell` flags none of
+them), so there is nothing for a dictionary pass to catch. The context has to
+reach the decoder, not a corrector downstream.
 
 ### Choosing a backend
 
 | Backend | 5s phrase | Decoding | Use when |
 |---|---|---|---|
+| `openvino` (default) | ~660ms | greedy | Speed matters — quiet room, everyday dictation |
 | `faster-whisper` | ~1450ms | beam=5 | Accuracy matters — noisy rooms, technical terms |
-| `openvino` | ~660ms | greedy | Speed matters — quiet room, everyday dictation |
 
 **openvino is ~2.2x faster but greedy-only** — `openvino-genai` 2026.2.1 cannot
 run beam search on GPU. In a quiet room that costs roughly one word error in
@@ -108,7 +147,15 @@ failed switch is visible rather than silent.
 
 The daemon logs `Ready: <backend>` on startup, and **falls back to
 `faster-whisper` automatically** if OpenVINO or its model is unavailable, so a
-broken GPU stack degrades rather than breaking dictation.
+broken GPU stack degrades rather than breaking dictation. `install.sh` does the
+same: if it cannot see a GPU it warns and installs the CPU backend instead of
+failing, so a machine without an Intel iGPU still gets working dictation.
+
+The GPU backend runs in a **child process**. When the kernel bans the GPU VM
+under memory pressure, OpenVINO aborts in a way no Python handler can catch, so
+the pipeline is isolated behind a process boundary — the worker dies, the daemon
+and your in-flight session do not. It restarts the worker once, then stays on
+CPU for the rest of the session.
 
 `faster-whisper` is always installed regardless of backend — it supplies the
 Silero VAD used for endpointing.
@@ -152,6 +199,7 @@ contained to that one phrase. See findings.
 src/dictate-server.py          resident daemon
 bin/dictate-toggle             hotkey client
 bin/dictate-backend            switch CPU <-> iGPU backend
+bin/dictate-mode               switch phrase / stream / single
 systemd/dictation.service      user service (templated)
 systemd/ydotool-override.conf  system drop-in (templated)
 install.sh                     deploys all of the above

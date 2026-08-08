@@ -14,7 +14,7 @@ UNIT="$HOME/.config/systemd/user"
 MODEL="${DICTATE_MODEL:-small.en}"
 MODE="${DICTATE_MODE:-phrase}"
 HOTKEY="${DICTATE_HOTKEY:-<Super>a}"
-BACKEND="${DICTATE_BACKEND:-faster-whisper}"   # faster-whisper | openvino
+BACKEND="${DICTATE_BACKEND:-openvino}"         # openvino | faster-whisper
 OV_DEVICE="${DICTATE_OV_DEVICE:-GPU}"          # GPU | CPU | HETERO:GPU,CPU
 OV_REPO="OpenVINO/whisper-small.en-int8-ov"
 
@@ -77,19 +77,30 @@ if [[ "$BACKEND" == "openvino" ]]; then
   done
   ((${#ovpkgs[@]})) && sudo dnf install -y "${ovpkgs[@]}"
   "$SHARE/venv/bin/pip" install --quiet openvino openvino-genai
-  if [[ ! -d "$SHARE/ov-model" ]]; then
-    say "Downloading $OV_REPO (~245MB)"
-    "$SHARE/venv/bin/python" - <<PY
-from huggingface_hub import snapshot_download
-snapshot_download("$OV_REPO", local_dir="$SHARE/ov-model")
-PY
-  fi
-  "$SHARE/venv/bin/python" -c "
+  # Probe before the 245MB download -- no point fetching a model we can't run.
+  if "$SHARE/venv/bin/python" -c "
 import openvino as ov
 devs=ov.Core().available_devices
 print('  OpenVINO devices:', devs)
 raise SystemExit(0 if any(d.startswith('GPU') for d in devs) or '$OV_DEVICE'=='CPU' else 1)
-" || die "OpenVINO cannot see the GPU; check intel-compute-runtime"
+"; then
+    if [[ ! -d "$SHARE/ov-model" ]]; then
+      say "Downloading $OV_REPO (~245MB)"
+      "$SHARE/venv/bin/python" - <<PY
+from huggingface_hub import snapshot_download
+snapshot_download("$OV_REPO", local_dir="$SHARE/ov-model")
+PY
+    fi
+  else
+    # Degrade rather than refuse. This used to be a hard failure, which was
+    # unreachable while faster-whisper was the default; now that openvino is,
+    # any machine without an Intel iGPU would hit it on a plain ./install.sh.
+    # The daemon already falls back to CPU when the GPU stack is missing, so
+    # the installer matches that rather than contradicting it.
+    say "warning: OpenVINO cannot see a GPU -- installing the faster-whisper backend"
+    say "         check intel-compute-runtime, then: dictate-backend openvino"
+    BACKEND=faster-whisper
+  fi
 fi
 
 # ----------------------------------------------------------------- files
@@ -97,6 +108,7 @@ say "Installing daemon and client"
 install -m 0644 "$REPO/src/dictate-server.py" "$SHARE/dictate-server.py"
 install -m 0755 "$REPO/bin/dictate-toggle" "$BIN/dictate-toggle"
 install -m 0755 "$REPO/bin/dictate-backend" "$BIN/dictate-backend"
+install -m 0755 "$REPO/bin/dictate-mode" "$BIN/dictate-mode"
 sed -e "s/@MODEL@/$MODEL/" -e "s/@MODE@/$MODE/" \
     -e "s/@BACKEND@/$BACKEND/" -e "s|@OV_DEVICE@|$OV_DEVICE|" \
   "$REPO/systemd/dictation.service" > "$UNIT/dictation.service"
