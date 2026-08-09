@@ -85,7 +85,14 @@ STREAM_MIN_S = 1.0  # too little audio to be worth a pass
 # which is what starves the decoder of context (measured: 4 errors in 71 words
 # at ~2s chunks, 0 at ~20s). Here a pause is ignored until the window is already
 # long enough to decode well, so clauses accumulate instead of being isolated.
-STREAM_FLUSH_S = 12
+STREAM_FLUSH_S = 8
+# Hard ceiling on a stream window, well under MAX_SEG_S. The iGPU has no VRAM,
+# so every decode pins system RAM, and this mode decodes continuously rather
+# than once per phrase -- windows that ran to 21.8s exhausted it and the driver
+# returned CL_OUT_OF_RESOURCES, killing the worker. Capping the window caps the
+# peak allocation. Cheap in accuracy: 8-15s is already far past the point where
+# context stops paying (measured 2s -> 12s recovered nearly all of it).
+STREAM_MAX_S = 15
 # Words held back from the agreed prefix while the window is still open.
 # Agreement means "two passes settled on this independently", but consecutive
 # passes only differ by ~0.5s of audio, and the last word of a hypothesis is the
@@ -687,6 +694,9 @@ class Session:
         # carries as `speech_seen`, for the same reason.
         self.streamed = []  # words typed from the current window, in order
         self.stream_heard = False
+        # Raised by stop() once the reader is joined and the buffer is final.
+        # The stream thread flushes on its own; see _stream_loop.
+        self.flush_ready = threading.Event()
         self.proc = subprocess.Popen(RECORD_CMD, stdout=subprocess.PIPE)
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         # stream transcribes and types on its own thread, so it needs no queue
@@ -831,7 +841,7 @@ class Session:
                 # have decoded well; shorter pauses are deliberately ignored.
                 tail_quiet = not has_speech(audio[-tail_n:])
                 ended = tail_quiet and audio.size >= STREAM_FLUSH_S * SR
-                full = audio.size >= MAX_SEG_S * SR
+                full = audio.size >= STREAM_MAX_S * SR
 
                 if tail_quiet and not (ended or full):
                     # Paused mid-thought, window too short to close. Decoding
@@ -872,6 +882,20 @@ class Session:
                 prev = hyp
             except Exception as exc:
                 print(f"stream loop failed: {exc}", file=sys.stderr, flush=True)
+
+        # Session over. Flush here rather than on the caller's thread: this must
+        # stay the only thread that ever calls the backend. OpenVinoBackend
+        # pairs each request with the next reply and carries no correlation ids,
+        # so a second concurrent caller crosses them -- one thread takes the
+        # other's answer, the loser waits out GPU_CALL_TIMEOUT_S, and the retry
+        # in Transcriber.transcribe then holds its lock through a 120s worker
+        # restart. That wedged the accept loop for eleven minutes on 2026-08-09,
+        # which looks from the outside like the hotkey being dead.
+        if self.flush_ready.wait(timeout=10):
+            try:
+                self._stream_flush()
+            except Exception as exc:
+                print(f"stream flush failed: {exc}", file=sys.stderr, flush=True)
 
     def _stream_flush(self):
         """Type whatever the last window had not committed yet.
@@ -920,18 +944,23 @@ class Session:
         except subprocess.TimeoutExpired:
             self.proc.kill()
         self.reader.join(timeout=2)
-        self.worker.join(timeout=2)
         if MODE == "stream":
-            # No queue to drain -- the stream thread transcribes inline -- so the
-            # tail is just whatever it hadn't committed when the hotkey landed.
+            # The buffer is final now the reader is done, so release the stream
+            # thread to flush it. We wait for that thread rather than decoding
+            # here, so exactly one thread ever drives the backend.
             if self._pending_stream_audio():
                 notify("⏳ Transcribing…", replace_id=self.notif_id,
                        urgency="critical")
-            try:
-                self._stream_flush()
-            except Exception as exc:
-                print(f"stream flush failed: {exc}", file=sys.stderr, flush=True)
+            self.flush_ready.set()
+            # Generous but bounded: one in-flight decode plus the flush. A
+            # wedged backend must not hold the toggle -- and therefore the whole
+            # accept loop -- hostage.
+            self.worker.join(timeout=GPU_CALL_TIMEOUT_S + 30)
+            if self.worker.is_alive():
+                print("stream thread still flushing after stop",
+                      file=sys.stderr, flush=True)
             return self.spoke
+        self.worker.join(timeout=2)
         # The whole remaining buffer, not one phrase: in MODE=single that is the
         # entire session, and if the detector died it is everything since. Split
         # it so no piece exceeds what Whisper's 30s window can hold.
