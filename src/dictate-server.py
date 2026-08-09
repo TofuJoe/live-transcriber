@@ -181,20 +181,53 @@ def hotkey_label():
     return "+".join(parts + [key.upper()]) if key else "+".join(parts)
 
 
+_clip_proc = None  # the wl-copy holding the clipboard, if any
+
+
 def type_text(text):
-    """Inject text into whatever window has focus, and mirror to clipboard."""
+    """Inject text into whatever window has focus, and mirror to clipboard.
+
+    Nothing here may block without a bound. This runs on the transcriber thread,
+    and a wedge here stops the queue draining -- which is exactly how a whole
+    conversation went untranscribed on 2026-08-09.
+    """
     env = dict(os.environ, YDOTOOL_SOCKET=YDOTOOL_SOCKET)
     # Feed via stdin rather than argv: escaping is off for stdin, so apostrophes
     # and quotes in transcribed text are typed literally instead of interpreted.
     # key-hold defaults to 20ms, which with key-delay meant ~28ms/char -- a
     # 124-char phrase took 3.5s to type. 1/1 measured lossless at 2.2ms/char.
-    subprocess.run(
-        ["ydotool", "type", "--key-hold", "1", "--key-delay", "1", "--file", "-"],
-        input=text.encode(),
-        env=env,
-        check=False,
-    )
-    subprocess.run(["wl-copy", "--", text], check=False)
+    try:
+        subprocess.run(
+            ["ydotool", "type", "--key-hold", "1", "--key-delay", "1", "--file", "-"],
+            input=text.encode(),
+            env=env,
+            check=False,
+            # ~2.2ms/char measured, so this is orders of magnitude of slack. It
+            # exists to bound a wedged ydotoold, not to pace typing.
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"ydotool timed out typing {len(text)} chars", file=sys.stderr,
+              flush=True)
+
+    global _clip_proc
+    # wl-copy stays resident to serve the clipboard: it forks, the direct child
+    # exits, and the survivor is reparented to init. When that fork does not
+    # happen the direct child never exits, and subprocess.run() waits on it
+    # forever -- observed holding the transcriber thread for minutes. So never
+    # wait on it. Starting the replacement first lets the previous holder retire
+    # on its own once ownership moves; terminate() only catches one that didn't.
+    try:
+        prev, _clip_proc = _clip_proc, subprocess.Popen(
+            ["wl-copy", "--", text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        if prev and prev.poll() is None:
+            prev.terminate()
+    except Exception as exc:  # clipboard mirroring is a nicety, never fatal
+        print(f"wl-copy failed: {exc}", file=sys.stderr, flush=True)
 
 
 def has_speech(audio, min_silence_ms=0):
@@ -1032,7 +1065,19 @@ def main():
     while True:
         conn, _ = server.accept()
         with conn:
-            cmd = conn.recv(64).decode().strip()
+            # A client that connects and then says nothing must not be able to
+            # stop the daemon serving anyone else. Without this timeout, recv()
+            # blocks forever, the accept loop never comes back, the listen(4)
+            # backlog fills, and every later press fails with EAGAIN -- the
+            # hotkey looks dead while the daemon reports healthy. Seen twice on
+            # 2026-08-09.
+            conn.settimeout(5)
+            try:
+                cmd = conn.recv(64).decode().strip()
+            except (TimeoutError, OSError) as exc:
+                print(f"client sent nothing ({exc}); dropped", file=sys.stderr,
+                      flush=True)
+                continue
             if cmd == "toggle":
                 try:
                     handle_toggle(backend)
