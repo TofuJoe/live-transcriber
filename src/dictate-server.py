@@ -58,6 +58,10 @@ SOFT_SEG_S = 20  # from here on, take any decent pause rather than wait for one
 # word joins, then thin out above ~200ms, so this sits above the articulation
 # noise and below anything a speaker would hear as a pause.
 OPPORTUNISTIC_GAP_MS = 200
+# Peak amplitude above which a chunk the VAD called silence is worth reporting.
+# Room tone on this machine sits well under 0.01; anything above this that got
+# discarded is a candidate for speech the VAD missed rather than a quiet room.
+VAD_SUSPECT_PEAK = 0.02
 READ_BYTES = 3200  # 100ms of s16le mono @16k
 # How often we check whether the phrase has ended. This is detection lag only:
 # TAIL_MS decides *what* a boundary is, POLL_S decides how fast we notice one,
@@ -725,6 +729,13 @@ class Session:
         # MODE=stream state. Words of the current window already typed, and
         # whether this window has heard speech yet -- the same bit find_commit_point
         # carries as `speech_seen`, for the same reason.
+        # Seconds of captured audio that reached the decoder vs was thrown away.
+        # The ratio is the direct measure of "missing sections": if capture
+        # accounts for the whole session and committed covers nearly all of it,
+        # anything missing was mis-transcribed rather than dropped.
+        self.committed_s = 0.0
+        self.discarded_s = 0.0
+        self.captured_s = 0.0
         self.streamed = []  # words typed from the current window, in order
         self.stream_heard = False
         # Raised by stop() once the reader is joined and the buffer is final.
@@ -755,6 +766,7 @@ class Session:
                 break
             with self.buf_lock:
                 self.buf.extend(chunk)
+            self.captured_s += len(chunk) / 2 / SR
 
     def _take(self, n_samples=None):
         """Pull audio out of the buffer as float32, removing what we took."""
@@ -774,13 +786,35 @@ class Session:
     def _commit(self, audio):
         """Hand a finished phrase to the transcriber. Must stay cheap: this runs
         on the detector thread, and anything slow here delays the *next* phrase
-        boundary rather than the current phrase's text."""
+        boundary rather than the current phrase's text.
+
+        Both rejections here delete audio outright, and both used to do it
+        silently -- so speech the VAD misclassified vanished with no error and
+        nothing in the log. "Missing sections" with a clean journal is exactly
+        what that looks like from the outside, which is why the discards are now
+        accounted for.
+        """
         if audio.size < 0.3 * SR:  # too short to be speech
+            self.discarded_s += audio.size / SR
             return
         # One VAD pass per commit (not per poll) to avoid queueing ~1.5s of
         # transcription on a chunk that turns out to be pure silence.
         if not has_speech(audio):
+            self.discarded_s += audio.size / SR
+            # Peak level separates the two cases that matter: genuine silence
+            # trimmed from the buffer, versus speech quiet enough for the VAD to
+            # miss. Only the second is a bug, and only the level tells them
+            # apart -- both look identical as a duration.
+            peak = float(np.abs(audio).max()) if audio.size else 0.0
+            if peak > VAD_SUSPECT_PEAK and audio.size > 0.5 * SR:
+                rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+                print(
+                    f"VAD discarded {audio.size / SR:.1f}s as silence but it is "
+                    f"not quiet: peak={peak:.3f} rms={rms:.4f}",
+                    flush=True,
+                )
             return
+        self.committed_s += audio.size / SR
         self.queue.put(audio)
 
     def _pending_stream_audio(self):
@@ -795,6 +829,14 @@ class Session:
     def _emit(self, audio):
         text = self.backend.transcribe(audio)
         if not text:
+            # This chunk cleared the VAD, so the audio reached the decoder and
+            # the decoder had nothing to say about it. A different failure from
+            # a VAD discard, and it also used to be silent.
+            print(
+                f"backend returned no text for {audio.size / SR:.1f}s that "
+                f"passed the VAD",
+                flush=True,
+            )
             return
         type_text((" " if self.spoke else "") + text)
         self.spoke = True
@@ -992,6 +1034,7 @@ class Session:
             if self.worker.is_alive():
                 print("stream thread still flushing after stop",
                       file=sys.stderr, flush=True)
+            self._log_audio_budget()
             return self.spoke
         self.worker.join(timeout=2)
         # The whole remaining buffer, not one phrase: in MODE=single that is the
@@ -1014,7 +1057,19 @@ class Session:
                 file=sys.stderr,
                 flush=True,
             )
+        self._log_audio_budget()
         return self.spoke
+
+    def _log_audio_budget(self):
+        """Account for every second captured. Unbalanced means audio went
+        somewhere it should not have."""
+        lost = self.captured_s - self.committed_s - self.discarded_s
+        print(
+            f"audio budget: captured={self.captured_s:.1f}s "
+            f"decoded={self.committed_s:.1f}s discarded={self.discarded_s:.1f}s "
+            f"unaccounted={lost:.1f}s",
+            flush=True,
+        )
 
 
 def handle_toggle(backend):
