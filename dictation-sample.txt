@@ -1,0 +1,3 @@
+Record in the conditions where it actually fails: same mic, same seat, same distance, same
+  background noise, speaking at your normal volume and pace with your natural pauses. If it fails
+  worse when you're leaning back or the fan is on, capture that.

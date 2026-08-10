@@ -62,6 +62,10 @@ OPPORTUNISTIC_GAP_MS = 200
 # Room tone on this machine sits well under 0.01; anything above this that got
 # discarded is a candidate for speech the VAD missed rather than a quiet room.
 VAD_SUSPECT_PEAK = 0.02
+# Silero's speech probability cutoff. Level-sensitive in practice: on a quiet
+# source it reads speech as silence and _commit deletes it. Tunable so a low
+# input can be compensated without touching the audio itself.
+VAD_THRESHOLD = float(os.environ.get("DICTATE_VAD_THRESHOLD", "0.5"))
 READ_BYTES = 3200  # 100ms of s16le mono @16k
 # How often we check whether the phrase has ended. This is detection lag only:
 # TAIL_MS decides *what* a boundary is, POLL_S decides how fast we notice one,
@@ -240,7 +244,7 @@ def has_speech(audio, min_silence_ms=0):
         get_speech_timestamps(
             audio,
             VadOptions(
-                threshold=0.5,
+                threshold=VAD_THRESHOLD,
                 min_speech_duration_ms=0,
                 min_silence_duration_ms=min_silence_ms,
                 speech_pad_ms=0,
@@ -265,7 +269,7 @@ def log_pause_gaps(audio):
         ts = get_speech_timestamps(
             audio,
             VadOptions(
-                threshold=0.5,
+                threshold=VAD_THRESHOLD,
                 min_speech_duration_ms=0,
                 min_silence_duration_ms=0,
                 speech_pad_ms=0,
@@ -291,7 +295,7 @@ def quietest_cut(window, search_s=5):
     ts = get_speech_timestamps(
         window[start:],
         VadOptions(
-            threshold=0.5,
+            threshold=VAD_THRESHOLD,
             min_speech_duration_ms=0,
             min_silence_duration_ms=0,
             speech_pad_ms=0,
@@ -328,7 +332,7 @@ def opportunistic_cut(audio):
     ts = get_speech_timestamps(
         audio[start:],
         VadOptions(
-            threshold=0.5,
+            threshold=VAD_THRESHOLD,
             min_speech_duration_ms=0,
             min_silence_duration_ms=0,
             speech_pad_ms=0,
@@ -1063,6 +1067,16 @@ class Session:
     def _log_audio_budget(self):
         """Account for every second captured. Unbalanced means audio went
         somewhere it should not have."""
+        if MODE == "stream":
+            # The decoded/discarded split is a phrase-mode concept: stream
+            # re-decodes an overlapping window, so summing decodes would count
+            # the same second many times and _commit is never involved. Report
+            # what is actually meaningful rather than a balance that cannot
+            # close -- an unaccounted figure equal to the whole session reads as
+            # a fault when it is just the wrong question.
+            print(f"audio budget: captured={self.captured_s:.1f}s "
+                  f"(stream re-decodes; no per-second split)", flush=True)
+            return
         lost = self.captured_s - self.committed_s - self.discarded_s
         print(
             f"audio budget: captured={self.captured_s:.1f}s "
