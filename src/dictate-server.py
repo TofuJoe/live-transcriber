@@ -418,11 +418,19 @@ class Transcriber:
 
     The failed audio is re-run on the new backend rather than dropped, so the
     phrase that triggered the fallback still gets typed.
+
+    The dead backend is kept alive, never freed: WhisperPipeline's destructor
+    calls clFinish on the banned VM, which throws out of a C++ destructor and
+    std::terminate()s the whole daemon (seen 2026-09-26: the fallback phrase
+    was transcribed on CPU, then the process aborted once the traceback --
+    the last reference to the pipeline -- was released, before it was typed).
+    Leaking one pipeline is cheap; SIGTERM exits without running finalizers.
     """
 
     def __init__(self):
         self.backend = make_backend()
         self.lock = threading.Lock()
+        self.graveyard = []  # dead GPU backends; see class docstring
 
     @property
     def label(self):
@@ -441,6 +449,7 @@ class Transcriber:
                     "Switched to the CPU backend for the rest of this session.",
                     urgency="normal",
                 )
+                self.graveyard.append(self.backend)
                 self.backend = FasterWhisperBackend(MODEL)
             return self.backend.transcribe(audio)
 
