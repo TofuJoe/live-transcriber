@@ -15,11 +15,16 @@ audio: a reader appends capture to a byte buffer, a detector scans it for phrase
 boundaries and hands each finished phrase off, and a single transcriber drains
 that queue. Only the transcriber types, so phrases land in the order spoken.
 
+With DICTATE_BACKEND=openvino the GPU model runs in a child process, so a GPU
+eviction kills only that worker; the daemon drops to CPU and brings the GPU
+back once memory allows. See Transcriber.
+
   DICTATE_MODE=phrase  (default) type each phrase as you finish it
   DICTATE_MODE=single            type everything at once when you stop
 """
 
 import functools
+import multiprocessing
 import os
 import queue
 import re
@@ -27,6 +32,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 import numpy as np
 from faster_whisper.vad import VadOptions, get_speech_timestamps
@@ -60,6 +66,17 @@ READ_BYTES = 3200  # 100ms of s16le mono @16k
 # and matches the rate audio actually arrives, so polling faster gains nothing.
 # Cost is one VAD pass over TAIL_MS of audio per tick -- ~1.5ms, ~1.5% of a core.
 POLL_S = 0.1
+
+# GPU recovery. A GPU failure is almost always the xe driver banning our VM
+# under memory pressure (see Transcriber), so retries are gated on headroom and
+# back off: 30s, 60s, 2m, ... capped at 15m, reset after 10m of healthy GPU.
+GPU_RETRY_MIN_S = 30
+GPU_RETRY_MAX_S = 15 * 60
+GPU_STABLE_S = 10 * 60
+GPU_CHECK_S = 5
+GPU_LOAD_TIMEOUT_S = 120  # first compile of the GPU kernels can be slow
+GPU_MIN_AVAILABLE_MB = 2048
+GPU_MAX_PSI_SOME = 5.0  # % of time some task stalled on memory, over 10s
 
 RECORD_CMD = [
     "parecord",
@@ -389,69 +406,237 @@ class OpenVinoBackend:
         return self.pipe.generate(audio).texts[0].strip()
 
 
-def make_backend():
-    """Build the configured backend, falling back to CPU if OpenVINO is
-    unavailable -- a missing GPU stack should degrade, not break dictation."""
-    if BACKEND == "openvino":
+def memory_headroom():
+    """(MemAvailable in MiB, memory PSI "some" avg10 in percent).
+
+    MemAvailable says how much could be had without swapping; PSI says whether
+    the kernel is already stalling tasks to get it. Low RAM with no stall is
+    fine (cache is cheap to drop), so the GPU gate checks both.
+    """
+    avail = 0
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) // 1024
+                break
+    try:
+        with open("/proc/pressure/memory") as f:
+            psi = float(f.readline().split()[1].split("=")[1])
+    except (OSError, IndexError, ValueError):
+        psi = 0.0  # no PSI (kernel built without it): judge on RAM alone
+    return avail, psi
+
+
+def _gpu_worker(conn, model_dir, device):
+    """Entry point of the GPU worker process: load, then serve phrases.
+
+    Leaves only via os._exit, never by returning or raising. A dead pipeline's
+    destructor calls clFinish on the banned VM and std::terminate()s whatever
+    process it runs in; skipping finalizers is how that stays harmless here.
+    """
+    try:
+        backend = OpenVinoBackend(model_dir, device)
+    except Exception as exc:
+        conn.send(("err", f"load failed: {exc}"))
+        os._exit(1)
+    conn.send(("ready", backend.label))
+    while True:
         try:
-            return OpenVinoBackend(OV_MODEL_DIR, OV_DEVICE)
+            audio = conn.recv()
+        except (EOFError, OSError):  # daemon went away
+            os._exit(0)
+        try:
+            conn.send(("ok", backend.transcribe(audio)))
         except Exception as exc:
-            print(f"openvino backend unavailable ({exc}); using CPU", flush=True)
-            notify(
-                "⚠️ OpenVINO unavailable",
-                "Fell back to the CPU backend.",
-                urgency="normal",
-            )
-    return FasterWhisperBackend(MODEL)
+            # One failure means the VM is banned; every later call would fail
+            # too. Report and die so the daemon can start a fresh process.
+            conn.send(("err", str(exc)))
+            os._exit(1)
+
+
+class GpuWorker:
+    """Daemon-side handle on one GPU worker process.
+
+    Any failure -- an error reply, the process dying (the destructor abort
+    included), or no reply in time (a GPU hang) -- kills the worker and raises.
+    A worker is never reused after a failure; the Transcriber spawns a new one.
+    """
+
+    label = OpenVinoBackend.label
+
+    def __init__(self):
+        ctx = multiprocessing.get_context("spawn")  # no fork of a threaded daemon
+        self.conn, child = ctx.Pipe()
+        self.proc = ctx.Process(
+            target=_gpu_worker,
+            args=(child, OV_MODEL_DIR, OV_DEVICE),
+            name="dictate-gpu",
+            daemon=True,
+        )
+        self.proc.start()
+        child.close()
+        kind, msg = self._reply(GPU_LOAD_TIMEOUT_S)
+        if kind != "ready":
+            self.kill()
+            raise RuntimeError(msg)
+
+    def _reply(self, timeout):
+        try:
+            if not self.conn.poll(timeout):
+                return "err", f"no reply in {timeout:.0f}s"
+            return self.conn.recv()
+        except (EOFError, OSError):
+            self.proc.join(timeout=1)
+            return "err", f"worker died (exit {self.proc.exitcode})"
+
+    def transcribe(self, audio):
+        try:
+            self.conn.send(audio)
+        except OSError as exc:
+            self.kill()
+            raise RuntimeError(f"worker unreachable: {exc}") from None
+        # The iGPU runs ~19x realtime, so 2x realtime plus slack is a hang.
+        kind, msg = self._reply(10 + 2 * audio.size / SR)
+        if kind != "ok":
+            self.kill()
+            raise RuntimeError(msg)
+        return msg
+
+    def kill(self):
+        # SIGKILL, not SIGTERM: nothing in the worker may get to run cleanup.
+        self.proc.kill()
+        self.proc.join(timeout=5)
+        self.conn.close()
 
 
 class Transcriber:
-    """Owns the active backend and survives its death mid-session.
+    """Owns the backends and moves between GPU and CPU as the GPU comes and goes.
 
     The iGPU has no VRAM: OpenVINO's buffers are system RAM that the kernel must
     pin into the GPU's address space. Under memory pressure that bind fails, the
     xe driver bans the GPU VM ("VM worker error: -12"), and every later inference
-    raises CL_OUT_OF_RESOURCES. The ban lasts the life of the process, so
-    retrying the same pipeline only re-raises -- the sole recovery is to stop
-    using the GPU. Falling back to CPU costs latency (~19x realtime -> ~5x) and
-    keeps dictation working until the daemon restarts.
+    raises CL_OUT_OF_RESOURCES. The ban lasts the life of the process, and the
+    dead pipeline cannot even be freed: its destructor throws out of C++ and
+    aborts the process (seen 2026-09-26, when that abort took the whole daemon
+    down before the fallback phrase was typed).
 
-    The failed audio is re-run on the new backend rather than dropped, so the
-    phrase that triggered the fallback still gets typed.
-
-    The dead backend is kept alive, never freed: WhisperPipeline's destructor
-    calls clFinish on the banned VM, which throws out of a C++ destructor and
-    std::terminate()s the whole daemon (seen 2026-09-26: the fallback phrase
-    was transcribed on CPU, then the process aborted once the traceback --
-    the last reference to the pipeline -- was released, before it was typed).
-    Leaking one pipeline is cheap; SIGTERM exits without running finalizers.
+    So the GPU lives in a separate process (GpuWorker) that can die or be killed
+    without touching the daemon. On failure the phrase is re-run on the CPU
+    backend, and a supervisor thread brings the GPU back with a fresh worker --
+    a new process gets a new VM -- once the backoff has passed and memory has
+    room. The CPU model is loaded only while needed and dropped on recovery, so
+    the RAM it holds isn't what evicts the GPU again.
     """
 
     def __init__(self):
-        self.backend = make_backend()
-        self.lock = threading.Lock()
-        self.graveyard = []  # dead GPU backends; see class docstring
+        self.lock = threading.Lock()  # guards the fields below
+        self.gpu_io = threading.Lock()  # one request on the worker pipe at a time
+        self.cpu_load = threading.Lock()
+        self.gpu = None
+        self.cpu = None
+        self.failures = 0  # consecutive, drives the backoff
+        self.retry_at = 0.0
+        self.gpu_since = 0.0
+        self.deferred = None  # last "not enough memory" reason, to log once
+        if BACKEND == "openvino":
+            if os.path.isdir(OV_MODEL_DIR):
+                self._spawn_gpu()
+                threading.Thread(target=self._supervise, daemon=True).start()
+            else:
+                print(
+                    f"OpenVINO model not found at {OV_MODEL_DIR}; using CPU. "
+                    "Run install.sh with DICTATE_BACKEND=openvino.",
+                    flush=True,
+                )
+        if self.gpu is None:
+            self._cpu()
 
     @property
     def label(self):
-        return self.backend.label
+        gpu = self.gpu
+        return gpu.label if gpu else FasterWhisperBackend.label
 
     def transcribe(self, audio):
+        gpu = self.gpu
+        if gpu is not None:
+            try:
+                with self.gpu_io:
+                    return gpu.transcribe(audio)
+            except Exception as exc:
+                self._gpu_failed(gpu, exc)
+        # Re-run on CPU rather than drop it: the phrase that killed the GPU
+        # still gets typed.
+        return self._cpu().transcribe(audio)
+
+    def _cpu(self):
+        with self.cpu_load:
+            if self.cpu is None:
+                self.cpu = FasterWhisperBackend(MODEL)
+            return self.cpu
+
+    def _gpu_failed(self, gpu, exc):
+        with self.lock:
+            if self.gpu is not gpu:
+                return  # someone else already handled this worker
+            self.gpu = None
+            delay = self._schedule_retry()
+        print(
+            f"GPU worker failed ({exc}); on CPU, retrying GPU in {delay:.0f}s",
+            flush=True,
+        )
+        notify(
+            "⚠️ GPU transcription failed",
+            "Using the CPU backend; the GPU comes back when memory allows.",
+            urgency="normal",
+        )
+
+    def _schedule_retry(self):
+        """Book the next GPU attempt. Call with self.lock held."""
+        now = time.monotonic()
+        if self.gpu_since and now - self.gpu_since >= GPU_STABLE_S:
+            self.failures = 0  # it had recovered; this is a new episode
+        self.gpu_since = 0.0
+        self.failures += 1
+        delay = min(GPU_RETRY_MIN_S * 2 ** (self.failures - 1), GPU_RETRY_MAX_S)
+        self.retry_at = now + delay
+        return delay
+
+    def _spawn_gpu(self):
         try:
-            return self.backend.transcribe(audio)
+            gpu = GpuWorker()
         except Exception as exc:
             with self.lock:
-                if not isinstance(self.backend, OpenVinoBackend):
-                    raise  # already on CPU; nothing left to fall back to
-                print(f"GPU backend died ({exc}); falling back to CPU", flush=True)
-                notify(
-                    "⚠️ GPU transcription failed",
-                    "Switched to the CPU backend for the rest of this session.",
-                    urgency="normal",
-                )
-                self.graveyard.append(self.backend)
-                self.backend = FasterWhisperBackend(MODEL)
-            return self.backend.transcribe(audio)
+                delay = self._schedule_retry()
+            print(f"GPU worker failed to start ({exc}); retry in {delay:.0f}s",
+                  flush=True)
+            return False
+        with self.lock:
+            self.gpu = gpu
+            self.gpu_since = time.monotonic()
+        return True
+
+    def _supervise(self):
+        """Bring the GPU back after a failure, when backoff and memory allow."""
+        while True:
+            time.sleep(GPU_CHECK_S)
+            with self.lock:
+                if self.gpu is not None or time.monotonic() < self.retry_at:
+                    continue
+            avail, psi = memory_headroom()
+            if avail < GPU_MIN_AVAILABLE_MB or psi > GPU_MAX_PSI_SOME:
+                reason = f"{avail} MiB available, memory PSI {psi:.1f}%"
+                if self.deferred is None:
+                    print(f"GPU retry deferred: {reason}", flush=True)
+                self.deferred = reason
+                continue
+            self.deferred = None
+            print(f"retrying GPU ({avail} MiB available)", flush=True)
+            if self._spawn_gpu():
+                with self.cpu_load:
+                    self.cpu = None  # give its RAM back to the GPU's headroom
+                print(f"GPU restored: {self.gpu.label}", flush=True)
+                notify("✅ GPU transcription restored", urgency="low",
+                       transient=True, expire_ms=3000)
 
 
 class Session:
